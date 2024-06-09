@@ -196,14 +196,21 @@ rt6_flush(struct in6_addr *gateway, struct ifnet *ifp)
 		error = rtable_walk(ifp->if_rdomain, AF_INET6, &rt,
 		    rt6_deleteroute, gateway);
 		if (rt != NULL && error == EEXIST) {
+			if (rt->rt_flags < 0 || rt->rt_flags > UINT_MAX ||
+			    rt_key(rt) == NULL || rt->rt_gateway == NULL) {
+				error = EINVAL;
+				break;
+			}
 			memset(&info, 0, sizeof(info));
-			info.rti_flags =  rt->rt_flags;
+			info.rti_flags = rt->rt_flags;
 			info.rti_info[RTAX_DST] = rt_key(rt);
 			info.rti_info[RTAX_GATEWAY] = rt->rt_gateway;
 			info.rti_info[RTAX_NETMASK] = rt_plen2mask(rt,
 			    &sa_mask);
+
 			error = rtrequest_delete(&info, RTP_ANY, ifp, NULL,
 			    ifp->if_rdomain);
+
 			if (error == 0)
 				error = EAGAIN;
 		}
@@ -218,6 +225,9 @@ int
 rt6_deleteroute(struct rtentry *rt, void *arg, unsigned int id)
 {
 	struct in6_addr *gate = (struct in6_addr *)arg;
+
+	if (rt == NULL || gate == NULL)
+		return (0);
 
 	if (rt->rt_gateway == NULL || rt->rt_gateway->sa_family != AF_INET6)
 		return (0);

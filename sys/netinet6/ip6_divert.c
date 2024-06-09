@@ -87,8 +87,13 @@ int	divert6_output(struct inpcb *, struct mbuf *, struct mbuf *,
 void
 divert6_init(void)
 {
-	in_pcbinit(&divb6table, divb6hashsize);
-	div6counters = counters_alloc(div6s_ncounters);
+	if (divb6hashsize > 0 && divb6hashsize <= INT_MAX) {
+		in_pcbinit(&divb6table, divb6hashsize);
+	}
+
+	if (div6s_ncounters > 0 && div6s_ncounters <= INT_MAX) {
+		div6counters = counters_alloc(div6s_ncounters);
+	}
 }
 
 int
@@ -273,7 +278,7 @@ divert6_attach(struct socket *so, int proto, int wait)
 {
 	int error;
 
-	if (so->so_pcb != NULL)
+	if (so == NULL || so->so_pcb != NULL)
 		return EINVAL;
 	if ((so->so_state & SS_PRIV) == 0)
 		return EACCES;
@@ -281,6 +286,9 @@ divert6_attach(struct socket *so, int proto, int wait)
 	error = in_pcballoc(so, &divb6table, wait);
 	if (error)
 		return (error);
+
+	if ((divert6_sendspace > INT_MAX) || (divert6_recvspace > INT_MAX) || (divert6_sendspace < 0) || (divert6_recvspace < 0))
+		return EINVAL;
 
 	error = soreserve(so, divert6_sendspace, divert6_recvspace);
 	if (error)
@@ -296,6 +304,11 @@ divert6_send(struct socket *so, struct mbuf *m, struct mbuf *addr,
 	struct inpcb *inp = sotoinpcb(so);
 
 	soassertlocked(so);
+
+	if (inp == NULL || m == NULL || addr == NULL || control == NULL) {
+		return -1; // return an appropriate error code
+	}
+
 	return (divert6_output(inp, m, addr, control));
 }
 
@@ -309,10 +322,22 @@ divert6_sysctl_div6stat(void *oldp, size_t *oldlenp, void *newp)
 
 	CTASSERT(sizeof(div6stat) == (nitems(counters) * sizeof(u_long)));
 
+	if (div6s_ncounters <= 0 || div6s_ncounters > SIZE_MAX / sizeof(uint64_t)) {
+		return -1; // Invalid size
+	}
+
+	if (nitems(counters) > SIZE_MAX / sizeof(u_long)) {
+		return -1; // Prevent overflow
+	}
+
 	counters_read(div6counters, counters, nitems(counters), NULL);
 
-	for (i = 0; i < nitems(counters); i++)
+	for (i = 0; i < nitems(counters); i++) {
+		if (i >= sizeof(div6stat) / sizeof(u_long)) {
+			return -1; // Prevent out-of-bounds access
+		}
 		words[i] = (u_long)counters[i];
+	}
 
 	return (sysctl_rdstruct(oldp, oldlenp, newp,
 	    &div6stat, sizeof(div6stat)));
@@ -330,6 +355,14 @@ divert6_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
+
+	/* Check for integer overflow for newlen */
+	if (newlen > SIZE_MAX / sizeof(int))
+		return (EOVERFLOW);
+
+	/* Check for out-of-bounds access */
+	if (name == NULL || (namelen > 0 && name[0] < 0))
+		return (EINVAL);
 
 	switch (name[0]) {
 	case DIVERT6CTL_STATS:

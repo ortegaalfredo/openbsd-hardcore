@@ -149,6 +149,11 @@ reroute:
 
 #ifdef IPSEC
 	if (ipsec_in_use) {
+		/* Assuming checks for m and tdb need to be added */
+		if (m == NULL) {
+			error = -EINVAL;
+			goto freecopy;
+		}
 		error = ip6_output_ipsec_lookup(m, NULL, &tdb);
 		if (error) {
 			/*
@@ -305,15 +310,20 @@ reroute:
 		/* already rerun the route lookup, go on */
 		m->m_pkthdr.pf.flags &= ~(PF_TAG_GENERATED | PF_TAG_REROUTE);
 	} else if (m->m_pkthdr.pf.flags & PF_TAG_REROUTE) {
-		/* tag as generated to skip over pf_test on rerun */
-		m->m_pkthdr.pf.flags |= PF_TAG_GENERATED;
-		srcrt = 1;
-		rtfree(rt);
-		rt = NULL;
-		if_put(ifp);
-		ifp = NULL;
-		goto reroute;
-	}
+    /* Check for potential integer overflow */
+    if (m->m_pkthdr.pf.flags + PF_TAG_GENERATED < m->m_pkthdr.pf.flags) {
+        /* Handle error condition, potential overflow detected */
+        return;
+    }
+    /* tag as generated to skip over pf_test on rerun */
+    m->m_pkthdr.pf.flags |= PF_TAG_GENERATED;
+    srcrt = 1;
+    rtfree(rt);
+    rt = NULL;
+    if_put(ifp);
+    ifp = NULL;
+    goto reroute;
+}
 #endif
 
 	error = if_output_tso(ifp, &m, dst, rt, ifp->if_mtu);

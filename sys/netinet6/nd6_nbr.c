@@ -992,11 +992,14 @@ nd6_na_output(struct ifnet *ifp, const struct in6_addr *daddr6,
 		if (sdl0 == NULL) {
 			mac = nd6_ifptomac(ifp);
 		} else if (sdl0->sa_family == AF_LINK) {
-			struct sockaddr_dl *sdl;
-			sdl = satosdl(sdl0);
-			if (sdl->sdl_alen == ifp->if_addrlen)
-				mac = LLADDR(sdl);
-		}
+    struct sockaddr_dl *sdl;
+    sdl = satosdl(sdl0);
+    if (sdl != NULL && ifp != NULL &&
+        sdl->sdl_alen == ifp->if_addrlen &&
+        sdl->sdl_alen <= sizeof(sdl->sdl_data)) {
+        mac = LLADDR(sdl);
+    }
+}
 	}
 	if (tlladdr && mac) {
 		int optlen = sizeof(struct nd_opt_hdr) + ifp->if_addrlen;
@@ -1031,12 +1034,18 @@ nd6_na_output(struct ifnet *ifp, const struct in6_addr *daddr6,
 caddr_t
 nd6_ifptomac(struct ifnet *ifp)
 {
+	if (!ifp) {
+		return NULL;
+	}
 	switch (ifp->if_type) {
 	case IFT_ETHER:
 	case IFT_IEEE1394:
 	case IFT_PROPVIRTUAL:
 	case IFT_CARP:
 	case IFT_IEEE80211:
+		if ((uintptr_t)ifp > UINTPTR_MAX - sizeof(struct ifnet)) {
+			return NULL;
+		}
 		return ((caddr_t)(ifp + 1));
 	default:
 		return NULL;
@@ -1048,6 +1057,9 @@ nd6_dad_find(struct ifaddr *ifa)
 {
 	struct dadq *dp;
 
+	if (!ifa)
+		return NULL;
+
 	TAILQ_FOREACH(dp, &dadq, dad_list) {
 		if (dp->dad_ifa == ifa)
 			return dp;
@@ -1058,6 +1070,9 @@ nd6_dad_find(struct ifaddr *ifa)
 void
 nd6_dad_destroy(struct dadq *dp)
 {
+	if (dp == NULL || ip6_dad_pending <= 0) {
+		return;
+	}
 	TAILQ_REMOVE(&dadq, dp, dad_list);
 	ifafree(dp->dad_ifa);
 	free(dp, M_IP6NDP, sizeof(*dp));
@@ -1074,7 +1089,10 @@ nd6_dad_starttimer(struct dadq *dp)
 void
 nd6_dad_stoptimer(struct dadq *dp)
 {
-	timeout_del(&dp->dad_timer_ch);
+    if (dp == NULL || (uintptr_t)dp > UINTPTR_MAX - sizeof(struct dadq)) {
+        return;
+    }
+    timeout_del(&dp->dad_timer_ch);
 }
 
 /*
@@ -1130,6 +1148,14 @@ nd6_dad_start(struct ifaddr *ifa)
 	 * (re)initialization.
 	 */
 	dp->dad_ifa = ifaref(ifa);
+	if (ip6_dad_count < 0 || ip6_dad_count > INT_MAX - dp->dad_ns_tcount) {
+		log(LOG_ERR, "%s: invalid DAD count for %s(%s)\n",
+			__func__, inet_ntop(AF_INET6, &ia6->ia_addr.sin6_addr,
+			    addr, sizeof(addr)),
+			ifa->ifa_ifp ? ifa->ifa_ifp->if_xname : "???");
+		free(dp, M_IP6NDP, sizeof(*dp));
+		return;
+	}
 	dp->dad_count = ip6_dad_count;
 	dp->dad_ns_icount = dp->dad_na_icount = 0;
 	dp->dad_ns_ocount = dp->dad_ns_tcount = 0;
@@ -1144,6 +1170,10 @@ void
 nd6_dad_stop(struct ifaddr *ifa)
 {
 	struct dadq *dp;
+
+	if (ifa == NULL) {
+		return;
+	}
 
 	dp = nd6_dad_find(ifa);
 	if (!dp) {
@@ -1174,8 +1204,16 @@ nd6_dad_timer(void *xifa)
 	}
 	ifa = xifa;
 	ia6 = ifatoia6(ifa);
+	if (ia6 == NULL) {
+		log(LOG_ERR, "%s: ifatoia6 returned null\n", __func__);
+		goto done;
+	}
 	taddr6 = ia6->ia_addr.sin6_addr;
 	ifp = ifa->ifa_ifp;
+	if (ifp == NULL || ifp->if_index < 0 || ifp->if_index > 0xFFFF) {
+		log(LOG_ERR, "%s: invalid ifp or if_index\n", __func__);
+		goto done;
+	}
 	dp = nd6_dad_find(ifa);
 	if (dp == NULL) {
 		log(LOG_ERR, "%s: DAD structure not found\n", __func__);
@@ -1232,7 +1270,7 @@ nd6_dad_timer(void *xifa)
 			    ifa->ifa_ifp->if_xname,
 			    inet_ntop(AF_INET6, &ia6->ia_addr.sin6_addr,
 				addr, sizeof(addr))));
-
+				
 			daddr6 = in6addr_linklocal_allrouters;
 			daddr6.s6_addr16[1] = htons(ifp->if_index);
 			/* RFC9131 - inform routers about our new address */
@@ -1281,6 +1319,9 @@ nd6_dad_ns_output(struct dadq *dp, struct ifaddr *ifa)
 	struct in6_ifaddr *ia6 = ifatoia6(ifa);
 	struct ifnet *ifp = ifa->ifa_ifp;
 
+	if (dp->dad_ns_tcount == UINT_MAX) {
+		return;
+	}
 	dp->dad_ns_tcount++;
 	if ((ifp->if_flags & IFF_UP) == 0) {
 #if 0
@@ -1295,6 +1336,9 @@ nd6_dad_ns_output(struct dadq *dp, struct ifaddr *ifa)
 		return;
 	}
 
+	if (dp->dad_ns_ocount == UINT_MAX) {
+		return;
+	}
 	dp->dad_ns_ocount++;
 	nd6_ns_output(ifp, NULL, &ia6->ia_addr.sin6_addr, NULL, 1);
 }
@@ -1326,7 +1370,11 @@ nd6_dad_ns_input(struct ifaddr *ifa)
 		 * not sure if I got a duplicate.
 		 * increment ns count and see what happens.
 		 */
-		dp->dad_ns_icount++;
+		if (dp->dad_ns_icount < UINT32_MAX) {
+			dp->dad_ns_icount++;
+		} else {
+			log(LOG_ERR, "%s: dad_ns_icount overflow detected\n", __func__);
+		}
 	}
 }
 
@@ -1338,8 +1386,13 @@ nd6_isneighbor(const struct ifnet *ifp, const struct in6_addr *addr)
 {
 	struct rtentry		*rt;
 	struct sockaddr_in6	 sin6;
-	unsigned int		 tableid = ifp->if_rdomain;
+	unsigned int		 tableid;
 	int rv = 0;
+
+	if (ifp == NULL || addr == NULL)
+		return 0;
+
+	tableid = ifp->if_rdomain;
 
 	memset(&sin6, 0, sizeof(sin6));
 	sin6.sin6_len = sizeof(struct sockaddr_in6);
@@ -1347,7 +1400,7 @@ nd6_isneighbor(const struct ifnet *ifp, const struct in6_addr *addr)
 	sin6.sin6_addr = *addr;
 	rt = rtalloc(sin6tosa(&sin6), 0, tableid);
 
-	if (rtisvalid(rt) && ISSET(rt->rt_flags, RTF_CLONING|RTF_CLONED))
+	if (rt != NULL && rtisvalid(rt) && ISSET(rt->rt_flags, RTF_CLONING|RTF_CLONED))
 		rv = if_isconnected(ifp, rt->rt_ifidx);
 
 	rtfree(rt);

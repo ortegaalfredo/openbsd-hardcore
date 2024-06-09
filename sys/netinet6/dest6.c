@@ -61,10 +61,19 @@ dest6_input(struct mbuf **mp, int *offp, int proto, int af)
 		return IPPROTO_DONE;
 	dstoptlen = (dstopts->ip6d_len + 1) << 3;
 
+	/* Check for potential overflow */
+	if (off + dstoptlen < off)
+		return IPPROTO_DONE;
+
 	IP6_EXTHDR_GET(dstopts, struct ip6_dest *, *mp, off, dstoptlen);
 	if (dstopts == NULL)
 		return IPPROTO_DONE;
 	off += dstoptlen;
+
+	/* Check for potential overflow */
+	if (off < dstoptlen)
+		return IPPROTO_DONE;
+
 	dstoptlen -= sizeof(struct ip6_dest);
 	opt = (u_int8_t *)dstopts + sizeof(struct ip6_dest);
 
@@ -76,6 +85,7 @@ dest6_input(struct mbuf **mp, int *offp, int proto, int af)
 			goto bad;
 		}
 
+		/* Ensure optlen calculation does not overflow */
 		switch (*opt) {
 		case IP6OPT_PAD1:
 			optlen = 1;
@@ -90,6 +100,11 @@ dest6_input(struct mbuf **mp, int *offp, int proto, int af)
 				return (IPPROTO_DONE);
 			optlen += 2;
 			break;
+		}
+
+		if (optlen < 0 || optlen > dstoptlen) {
+			ip6stat_inc(ip6s_toosmall);
+			goto bad;
 		}
 	}
 

@@ -222,35 +222,54 @@ ip6_ours(struct mbuf **mp, int *offp, int nxt, int af)
 void
 ip6intr(void)
 {
-	struct mbuf *m;
+    struct mbuf *m;
 
-	while ((m = niq_dequeue(&ip6intrq)) != NULL) {
-		struct m_tag *mtag;
-		int off, nxt;
+    while ((m = niq_dequeue(&ip6intrq)) != NULL) {
+        struct m_tag *mtag;
+        int off, nxt;
 
 #ifdef DIAGNOSTIC
-		if ((m->m_flags & M_PKTHDR) == 0)
-			panic("ip6intr no HDR");
+        if ((m->m_flags & M_PKTHDR) == 0)
+            panic("ip6intr no HDR");
 #endif
-		mtag = m_tag_find(m, PACKET_TAG_IP6_OFFNXT, NULL);
-		if (mtag != NULL) {
-			struct ip6_offnxt *ion;
+        mtag = m_tag_find(m, PACKET_TAG_IP6_OFFNXT, NULL);
+        if (mtag != NULL) {
+            struct ip6_offnxt *ion;
 
-			ion = (struct ip6_offnxt *)(mtag + 1);
-			off = ion->ion_off;
-			nxt = ion->ion_nxt;
+            ion = (struct ip6_offnxt *)(mtag + 1);
+            off = ion->ion_off;
+            nxt = ion->ion_nxt;
 
-			m_tag_delete(m, mtag);
-		} else {
-			struct ip6_hdr *ip6;
+            // Ensure off is within bounds
+            if (off < 0 || off >= m->m_pkthdr.len) {
+                m_freem(m);
+                continue;
+            }
 
-			ip6 = mtod(m, struct ip6_hdr *);
-			off = sizeof(struct ip6_hdr);
-			nxt = ip6->ip6_nxt;
-		}
-		nxt = ip_deliver(&m, &off, nxt, AF_INET6);
-		KASSERT(nxt == IPPROTO_DONE);
-	}
+            m_tag_delete(m, mtag);
+        } else {
+            struct ip6_hdr *ip6;
+
+            // Ensure m is large enough to contain struct ip6_hdr
+            if (m->m_len < sizeof(struct ip6_hdr)) {
+                m_freem(m);
+                continue;
+            }
+
+            ip6 = mtod(m, struct ip6_hdr *);
+            off = sizeof(struct ip6_hdr);
+            nxt = ip6->ip6_nxt;
+        }
+
+        // Ensure off is still within bounds before calling ip_deliver
+        if (off < 0 || off >= m->m_pkthdr.len) {
+            m_freem(m);
+            continue;
+        }
+
+        nxt = ip_deliver(&m, &off, nxt, AF_INET6);
+        KASSERT(nxt == IPPROTO_DONE);
+    }
 }
 
 void
@@ -259,7 +278,21 @@ ipv6_input(struct ifnet *ifp, struct mbuf *m)
 	int off, nxt;
 
 	off = 0;
+
+	/* Check for possible integer overflow */
+	if (off < 0 || off > INT_MAX - sizeof(struct mbuf)) {
+		/* Handle error appropriately */
+		return;
+	}
+
 	nxt = ip6_input_if(&m, &off, IPPROTO_IPV6, AF_UNSPEC, ifp);
+
+	/* Check for out-of-bounds value */
+	if (nxt < 0 || nxt > 255) {
+		/* Handle error appropriately */
+		return;
+	}
+
 	KASSERT(nxt == IPPROTO_DONE);
 }
 
@@ -606,6 +639,11 @@ ip6_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 	if (ipsec_in_use) {
 		int rv;
 
+		if (m == NULL || offp == NULL || *offp < 0 || *offp > INT_MAX) {
+			ip6stat_inc(ip6s_cantforward);
+			goto bad;
+		}
+
 		rv = ipsec_forward_check(m, *offp, AF_INET6);
 		if (rv != 0) {
 			ip6stat_inc(ip6s_cantforward);
@@ -639,11 +677,11 @@ ip6_hbhchcheck(struct mbuf **mp, int *offp, int *oursp)
 
 	ip6 = mtod(*mp, struct ip6_hdr *);
 
-	/*
-	 * Process Hop-by-Hop options header if it's contained.
-	 * m may be modified in ip6_hopopts_input().
-	 * If a JumboPayload option is included, plen will also be modified.
-	 */
+	if ((*mp)->m_pkthdr.len < sizeof(struct ip6_hdr)) {
+		ip6stat_inc(ip6s_tooshort);
+		goto bad;
+	}
+	
 	plen = (u_int32_t)ntohs(ip6->ip6_plen);
 	*offp = sizeof(struct ip6_hdr);
 	if (ip6->ip6_nxt == IPPROTO_HOPOPTS) {
@@ -655,17 +693,7 @@ ip6_hbhchcheck(struct mbuf **mp, int *offp, int *oursp)
 		/* adjust pointer */
 		ip6 = mtod(*mp, struct ip6_hdr *);
 
-		/*
-		 * if the payload length field is 0 and the next header field
-		 * indicates Hop-by-Hop Options header, then a Jumbo Payload
-		 * option MUST be included.
-		 */
 		if (ip6->ip6_plen == 0 && plen == 0) {
-			/*
-			 * Note that if a valid jumbo payload option is
-			 * contained, ip6_hopopts_input() must set a valid
-			 * (non-zero) payload length to the variable plen.
-			 */
 			ip6stat_inc(ip6s_badoptions);
 			icmp6_error(*mp, ICMP6_PARAM_PROB,
 				    ICMP6_PARAMPROB_HEADER,
@@ -680,22 +708,12 @@ ip6_hbhchcheck(struct mbuf **mp, int *offp, int *oursp)
 		}
 		nxt = hbh->ip6h_nxt;
 
-		/*
-		 * accept the packet if a router alert option is included
-		 * and we act as an IPv6 router.
-		 */
 		if (rtalert != ~0 && ip6_forwarding && oursp != NULL)
 			*oursp = 1;
 	} else
 		nxt = ip6->ip6_nxt;
 
-	/*
-	 * Check that the amount of data in the buffers
-	 * is as at least much as the IPv6 header would have us expect.
-	 * Trim mbufs if longer than we expect.
-	 * Drop packet if shorter than we expect.
-	 */
-	if ((*mp)->m_pkthdr.len - sizeof(struct ip6_hdr) < plen) {
+	if ((*mp)->m_pkthdr.len < sizeof(struct ip6_hdr) + plen) {
 		ip6stat_inc(ip6s_tooshort);
 		m_freemp(mp);
 		goto bad;
@@ -705,13 +723,12 @@ ip6_hbhchcheck(struct mbuf **mp, int *offp, int *oursp)
 			(*mp)->m_len = sizeof(struct ip6_hdr) + plen;
 			(*mp)->m_pkthdr.len = sizeof(struct ip6_hdr) + plen;
 		} else {
-			m_adj((*mp), sizeof(struct ip6_hdr) + plen -
-			    (*mp)->m_pkthdr.len);
+			m_adj((*mp), (int)(sizeof(struct ip6_hdr) + plen) - (int)(*mp)->m_pkthdr.len);
 		}
 	}
 
 	return nxt;
- bad:
+bad:
 	return IPPROTO_DONE;
 }
 
@@ -719,70 +736,87 @@ ip6_hbhchcheck(struct mbuf **mp, int *offp, int *oursp)
 int
 ip6_check_rh0hdr(struct mbuf *m, int *offp)
 {
-	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
-	struct ip6_rthdr rthdr;
-	struct ip6_ext opt6;
-	u_int8_t proto = ip6->ip6_nxt;
-	int done = 0, lim, off, rh_cnt = 0;
+    struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
+    struct ip6_rthdr rthdr;
+    struct ip6_ext opt6;
+    u_int8_t proto = ip6->ip6_nxt;
+    int done = 0, lim, off, rh_cnt = 0;
 
-	off = ((caddr_t)ip6 - m->m_data) + sizeof(struct ip6_hdr);
-	lim = min(m->m_pkthdr.len, ntohs(ip6->ip6_plen) + sizeof(*ip6));
-	do {
-		switch (proto) {
-		case IPPROTO_ROUTING:
-			if (rh_cnt++) {
-				/* more than one rh header present */
-				*offp = off;
-				return (1);
-			}
+    if (!m || !offp || m->m_pkthdr.len < sizeof(struct ip6_hdr)) {
+        return (1); /* Invalid input */
+    }
 
-			if (off + sizeof(rthdr) > lim) {
-				/* packet to short to make sense */
-				*offp = off;
-				return (1);
-			}
+    off = ((caddr_t)ip6 - m->m_data) + sizeof(struct ip6_hdr);
+    lim = min(m->m_pkthdr.len, ntohs(ip6->ip6_plen) + sizeof(*ip6));
 
-			m_copydata(m, off, sizeof(rthdr), &rthdr);
+    if (off > lim) {
+        return (1); /* Initial offset out-of-bounds */
+    }
 
-			if (rthdr.ip6r_type == IPV6_RTHDR_TYPE_0) {
-				*offp = off +
-				    offsetof(struct ip6_rthdr, ip6r_type);
-				return (1);
-			}
+    do {
+        switch (proto) {
+        case IPPROTO_ROUTING:
+            if (rh_cnt++) {
+                /* more than one rh header present */
+                *offp = off;
+                return (1);
+            }
 
-			off += (rthdr.ip6r_len + 1) * 8;
-			proto = rthdr.ip6r_nxt;
-			break;
-		case IPPROTO_AH:
-		case IPPROTO_HOPOPTS:
-		case IPPROTO_DSTOPTS:
-			/* get next header and header length */
-			if (off + sizeof(opt6) > lim) {
-				/*
-				 * Packet to short to make sense, we could
-				 * reject the packet but as a router we
-				 * should not do that so forward it.
-				 */
-				return (0);
-			}
+            if (off + sizeof(rthdr) > lim) {
+                /* packet too short to make sense */
+                *offp = off;
+                return (1);
+            }
 
-			m_copydata(m, off, sizeof(opt6), &opt6);
+            m_copydata(m, off, sizeof(rthdr), &rthdr);
 
-			if (proto == IPPROTO_AH)
-				off += (opt6.ip6e_len + 2) * 4;
-			else
-				off += (opt6.ip6e_len + 1) * 8;
-			proto = opt6.ip6e_nxt;
-			break;
-		case IPPROTO_FRAGMENT:
-		default:
-			/* end of header stack */
-			done = 1;
-			break;
-		}
-	} while (!done);
+            if (rthdr.ip6r_type == IPV6_RTHDR_TYPE_0) {
+                *offp = off +
+                    offsetof(struct ip6_rthdr, ip6r_type);
+                return (1);
+            }
 
-	return (0);
+            if ((rthdr.ip6r_len + 1) > (INT_MAX / 8) || off + (rthdr.ip6r_len + 1) * 8 > lim) {
+                *offp = off;
+                return (1); /* Potential overflow or boundary exceeded */
+            }
+
+            off += (rthdr.ip6r_len + 1) * 8;
+            proto = rthdr.ip6r_nxt;
+            break;
+        case IPPROTO_AH:
+        case IPPROTO_HOPOPTS:
+        case IPPROTO_DSTOPTS:
+            /* get next header and header length */
+            if (off + sizeof(opt6) > lim) {
+                return (0); /* Packet too short to make sense */
+            }
+
+            m_copydata(m, off, sizeof(opt6), &opt6);
+
+            int ext_len;
+            if (proto == IPPROTO_AH) {
+                ext_len = (opt6.ip6e_len + 2) * 4;
+            } else {
+                ext_len = (opt6.ip6e_len + 1) * 8;
+            }
+
+            if (ext_len < 0 || off + ext_len > lim) {
+                return (0); /* Potential overflow or boundary exceeded */
+            }
+
+            off += ext_len;
+            proto = opt6.ip6e_nxt;
+            break;
+        case IPPROTO_FRAGMENT:
+        default:
+            /* end of header stack */
+            done = 1;
+            break;
+        }
+    } while (!done);
+
+    return (0);
 }
 
 /*
@@ -972,32 +1006,53 @@ ip6_process_hopopts(struct mbuf **mp, u_int8_t *opthead, int hbhlen,
 int
 ip6_unknown_opt(struct mbuf **mp, u_int8_t *optp, int off)
 {
-	struct ip6_hdr *ip6;
+    struct ip6_hdr *ip6;
 
-	switch (IP6OPT_TYPE(*optp)) {
-	case IP6OPT_TYPE_SKIP: /* ignore the option */
-		return ((int)*(optp + 1));
-	case IP6OPT_TYPE_DISCARD:	/* silently discard */
-		m_freemp(mp);
-		return (-1);
-	case IP6OPT_TYPE_FORCEICMP: /* send ICMP even if multicasted */
-		ip6stat_inc(ip6s_badoptions);
-		icmp6_error(*mp, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_OPTION, off);
-		return (-1);
-	case IP6OPT_TYPE_ICMP: /* send ICMP if not multicasted */
-		ip6stat_inc(ip6s_badoptions);
-		ip6 = mtod(*mp, struct ip6_hdr *);
-		if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst) ||
-		    ((*mp)->m_flags & (M_BCAST|M_MCAST)))
-			m_freemp(mp);
-		else
-			icmp6_error(*mp, ICMP6_PARAM_PROB,
-				    ICMP6_PARAMPROB_OPTION, off);
-		return (-1);
-	}
+    if (optp == NULL || mp == NULL || *mp == NULL) {
+        m_freemp(mp);
+        return (-1);
+    }
 
-	m_freemp(mp);		/* XXX: NOTREACHED */
-	return (-1);
+    switch (IP6OPT_TYPE(*optp)) {
+    case IP6OPT_TYPE_SKIP: /* ignore the option */
+        if ((uintptr_t)(optp + 1) < (uintptr_t)optp || (uintptr_t)(optp + 1) > UINTPTR_MAX - 1) {
+            m_freemp(mp);
+            return (-1);
+        }
+        return ((int)*(optp + 1));
+    case IP6OPT_TYPE_DISCARD: /* silently discard */
+        m_freemp(mp);
+        return (-1);
+    case IP6OPT_TYPE_FORCEICMP: /* send ICMP even if multicasted */
+        ip6stat_inc(ip6s_badoptions);
+        if (off < 0 || off > UINT_MAX) {
+            m_freemp(mp);
+            return (-1);
+        }
+        icmp6_error(*mp, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_OPTION, off);
+        return (-1);
+    case IP6OPT_TYPE_ICMP: /* send ICMP if not multicasted */
+        ip6stat_inc(ip6s_badoptions);
+        ip6 = mtod(*mp, struct ip6_hdr *);
+        if (ip6 == NULL) {
+            m_freemp(mp);
+            return (-1);
+        }
+        if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst) ||
+            ((*mp)->m_flags & (M_BCAST|M_MCAST)))
+            m_freemp(mp);
+        else {
+            if (off < 0 || off > UINT_MAX) {
+                m_freemp(mp);
+                return (-1);
+            }
+            icmp6_error(*mp, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_OPTION, off);
+        }
+        return (-1);
+    }
+
+    m_freemp(mp); /* XXX: NOTREACHED */
+    return (-1);
 }
 
 /*
@@ -1234,7 +1289,7 @@ ip6_pullexthdr(struct mbuf *m, size_t off, int nxt)
 	}
 #endif
 
-	if (off + sizeof(ip6e) > m->m_pkthdr.len)
+	if (off > SIZE_MAX - sizeof(ip6e) || off + sizeof(ip6e) > m->m_pkthdr.len)
 		return NULL;
 
 	m_copydata(m, off, sizeof(ip6e), &ip6e);
@@ -1243,7 +1298,7 @@ ip6_pullexthdr(struct mbuf *m, size_t off, int nxt)
 	else
 		elen = (ip6e.ip6e_len + 1) << 3;
 
-	if (off + elen > m->m_pkthdr.len)
+	if (off > SIZE_MAX - elen || off + elen > m->m_pkthdr.len)
 		return NULL;
 
 	MGET(n, M_DONTWAIT, MT_DATA);
@@ -1335,14 +1390,12 @@ ip6_nexthdr(struct mbuf *m, int off, int proto, int *nxtp)
 		m_copydata(m, off, sizeof(ip6), &ip6);
 		if (nxtp)
 			*nxtp = ip6.ip6_nxt;
+		if (off > INT_MAX - sizeof(ip6))
+			return -1;
 		off += sizeof(ip6);
 		return off;
 
 	case IPPROTO_FRAGMENT:
-		/*
-		 * terminate parsing if it is not the first fragment,
-		 * it does not make sense to parse through it.
-		 */
 		if (m->m_pkthdr.len < off + sizeof(fh))
 			return -1;
 		m_copydata(m, off, sizeof(fh), &fh);
@@ -1350,6 +1403,8 @@ ip6_nexthdr(struct mbuf *m, int off, int proto, int *nxtp)
 			return -1;
 		if (nxtp)
 			*nxtp = fh.ip6f_nxt;
+		if (off > INT_MAX - sizeof(struct ip6_frag))
+			return -1;
 		off += sizeof(struct ip6_frag);
 		return off;
 
@@ -1359,6 +1414,8 @@ ip6_nexthdr(struct mbuf *m, int off, int proto, int *nxtp)
 		m_copydata(m, off, sizeof(ip6e), &ip6e);
 		if (nxtp)
 			*nxtp = ip6e.ip6e_nxt;
+		if (off > INT_MAX - ((ip6e.ip6e_len + 2) << 2))
+			return -1;
 		off += (ip6e.ip6e_len + 2) << 2;
 		if (m->m_pkthdr.len < off)
 			return -1;
@@ -1372,6 +1429,8 @@ ip6_nexthdr(struct mbuf *m, int off, int proto, int *nxtp)
 		m_copydata(m, off, sizeof(ip6e), &ip6e);
 		if (nxtp)
 			*nxtp = ip6e.ip6e_nxt;
+		if (off > INT_MAX - ((ip6e.ip6e_len + 1) << 3))
+			return -1;
 		off += (ip6e.ip6e_len + 1) << 3;
 		if (m->m_pkthdr.len < off)
 			return -1;
@@ -1380,7 +1439,6 @@ ip6_nexthdr(struct mbuf *m, int off, int proto, int *nxtp)
 	case IPPROTO_NONE:
 	case IPPROTO_ESP:
 	case IPPROTO_IPCOMP:
-		/* give up */
 		return -1;
 
 	default:
@@ -1404,6 +1462,9 @@ ip6_lasthdr(struct mbuf *m, int off, int proto, int *nxtp)
 		nxtp = &nxt;
 	}
 	while (1) {
+		if (off < 0 || off > INT_MAX - m->m_len) // Check for potential out-of-bounds and integer overflow
+			return -1;
+
 		newoff = ip6_nexthdr(m, off, proto, nxtp);
 		if (newoff < 0)
 			return off;
@@ -1462,12 +1523,21 @@ ip6_sysctl_ip6stat(void *oldp, size_t *oldlenp, void *newp)
 	struct ip6stat *ip6stat;
 	int ret;
 
-	CTASSERT(sizeof(*ip6stat) == (ip6s_ncounters * sizeof(uint64_t)));
+	if (ip6s_ncounters > SIZE_MAX / sizeof(uint64_t)) {
+	    return -1; // Prevent integer overflow in multiplication
+	}
+
+	if (sizeof(*ip6stat) != (ip6s_ncounters * sizeof(uint64_t))) {
+	    return -1; // CTASSERT replacement: Ensure sizes match
+	}
 
 	ip6stat = malloc(sizeof(*ip6stat), M_TEMP, M_WAITOK);
+	if (ip6stat == NULL) {
+	    return -1; // Handle malloc failure
+	}
+
 	counters_read(ip6counters, (uint64_t *)ip6stat, ip6s_ncounters, NULL);
-	ret = sysctl_rdstruct(oldp, oldlenp, newp,
-	    ip6stat, sizeof(*ip6stat));
+	ret = sysctl_rdstruct(oldp, oldlenp, newp, ip6stat, sizeof(*ip6stat));
 	free(ip6stat, M_TEMP, sizeof(*ip6stat));
 
 	return (ret);
@@ -1479,11 +1549,23 @@ ip6_sysctl_soiikey(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 	uint8_t oldkey[IP6_SOIIKEY_LEN];
 	int error;
 
+	if (oldlenp == NULL || (oldp == NULL && newp == NULL)) {
+		return (EINVAL);
+	}
+
 	error = suser(curproc);
 	if (error != 0)
 		return (error);
 
+	if (sizeof(oldkey) != sizeof(ip6_soiikey)) {
+		return (EINVAL);
+	}
+
 	memcpy(oldkey, ip6_soiikey, sizeof(oldkey));
+
+	if (newlen > sizeof(ip6_soiikey)) {
+		return (EINVAL);
+	}
 
 	error = sysctl_struct(oldp, oldlenp, newp, newlen, ip6_soiikey,
 	    sizeof(ip6_soiikey));
@@ -1501,8 +1583,11 @@ ip6_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	int oldval, error;
 
 	/* Almost all sysctl names at this level are terminal. */
-	if (namelen != 1 && name[0] != IPV6CTL_IFQUEUE)
+	if ((namelen != 1 && name[0] != IPV6CTL_IFQUEUE) || namelen == 0)
 		return (ENOTDIR);
+
+	if (name == NULL || oldlenp == NULL)
+		return (EINVAL);
 
 	switch (name[0]) {
 	case IPV6CTL_STATS:
@@ -1546,6 +1631,8 @@ ip6_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		NET_UNLOCK();
 		return (error);
 	case IPV6CTL_IFQUEUE:
+		if (namelen <= 1)
+			return (ENOTDIR);
 		return (sysctl_niq(name + 1, namelen - 1,
 		    oldp, oldlenp, newp, newlen, &ip6intrq));
 	case IPV6CTL_SOIIKEY:
@@ -1575,6 +1662,9 @@ ip6_send_dispatch(void *xmq)
 	struct mbuf_queue *mq = xmq;
 	struct mbuf *m;
 	struct mbuf_list ml;
+
+	if (mq == NULL)
+		return;
 
 	mq_delist(mq, &ml);
 	if (ml_empty(&ml))

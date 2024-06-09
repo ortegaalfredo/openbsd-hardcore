@@ -137,113 +137,131 @@ in6_pcbhash(struct inpcbtable *table, u_int rdomain,
     const struct in6_addr *faddr, u_short fport,
     const struct in6_addr *laddr, u_short lport)
 {
-	SIPHASH_CTX ctx;
-	u_int32_t nrdom = htonl(rdomain);
+    SIPHASH_CTX ctx;
+    u_int32_t nrdom;
 
-	SipHash24_Init(&ctx, &table->inpt_key);
-	SipHash24_Update(&ctx, &nrdom, sizeof(nrdom));
-	SipHash24_Update(&ctx, faddr, sizeof(*faddr));
-	SipHash24_Update(&ctx, &fport, sizeof(fport));
-	SipHash24_Update(&ctx, laddr, sizeof(*laddr));
-	SipHash24_Update(&ctx, &lport, sizeof(lport));
-	return SipHash24_End(&ctx);
+    if (table == NULL || faddr == NULL || laddr == NULL) {
+        return 0; // or handle error appropriately
+    }
+
+    if (rdomain > UINT32_MAX || fport > USHRT_MAX || lport > USHRT_MAX) {
+        return 0; // or handle error appropriately
+    }
+
+    nrdom = htonl(rdomain);
+
+    SipHash24_Init(&ctx, &table->inpt_key);
+    SipHash24_Update(&ctx, &nrdom, sizeof(nrdom));
+    SipHash24_Update(&ctx, faddr, sizeof(*faddr));
+    SipHash24_Update(&ctx, &fport, sizeof(fport));
+    SipHash24_Update(&ctx, laddr, sizeof(*laddr));
+    SipHash24_Update(&ctx, &lport, sizeof(lport));
+    return SipHash24_End(&ctx);
 }
 
 int
 in6_pcbaddrisavail_lock(const struct inpcb *inp, struct sockaddr_in6 *sin6,
     int wild, struct proc *p, int lock)
 {
-	struct socket *so = inp->inp_socket;
-	struct inpcbtable *table = inp->inp_table;
-	u_short lport = sin6->sin6_port;
-	int reuseport = (so->so_options & SO_REUSEPORT);
+    struct socket *so = inp->inp_socket;
+    struct inpcbtable *table = inp->inp_table;
+    u_short lport = sin6->sin6_port;
+    int reuseport = (so->so_options & SO_REUSEPORT);
 
-	wild |= INPLOOKUP_IPV6;
-	/* KAME hack: embed scopeid */
-	if (in6_embedscope(&sin6->sin6_addr, sin6,
-	    inp->inp_outputopts6, inp->inp_moptions6) != 0)
-		return (EINVAL);
-	/* this must be cleared for ifa_ifwithaddr() */
-	sin6->sin6_scope_id = 0;
-	/* reject IPv4 mapped address, we have no support for it */
-	if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr))
-		return (EADDRNOTAVAIL);
+    wild |= INPLOOKUP_IPV6;
+    /* KAME hack: embed scopeid */
+    if (in6_embedscope(&sin6->sin6_addr, sin6,
+        inp->inp_outputopts6, inp->inp_moptions6) != 0)
+        return (EINVAL);
+    /* this must be cleared for ifa_ifwithaddr() */
+    sin6->sin6_scope_id = 0;
+    /* reject IPv4 mapped address, we have no support for it */
+    if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr))
+        return (EADDRNOTAVAIL);
 
-	if (IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
-		/*
-		 * Treat SO_REUSEADDR as SO_REUSEPORT for multicast;
-		 * allow complete duplication of binding if
-		 * SO_REUSEPORT is set, or if SO_REUSEADDR is set
-		 * and a multicast address is bound on both
-		 * new and duplicated sockets.
-		 */
-		if (so->so_options & (SO_REUSEADDR|SO_REUSEPORT))
-			reuseport = SO_REUSEADDR | SO_REUSEPORT;
-	} else if (!IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr)) {
-		struct ifaddr *ifa = NULL;
+    if (IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
+        /*
+         * Treat SO_REUSEADDR as SO_REUSEPORT for multicast;
+         * allow complete duplication of binding if
+         * SO_REUSEPORT is set, or if SO_REUSEADDR is set
+         * and a multicast address is bound on both
+         * new and duplicated sockets.
+         */
+        if (so->so_options & (SO_REUSEADDR|SO_REUSEPORT))
+            reuseport = SO_REUSEADDR | SO_REUSEPORT;
+    } else if (!IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr)) {
+        struct ifaddr *ifa = NULL;
 
-		sin6->sin6_port = 0;  /*
-				       * Yechhhh, because of upcoming
-				       * call to ifa_ifwithaddr(), which
-				       * does bcmp's over the PORTS as
-				       * well.  (What about flow?)
-				       */
-		sin6->sin6_flowinfo = 0;
-		if (!(so->so_options & SO_BINDANY) &&
-		    (ifa = ifa_ifwithaddr(sin6tosa(sin6),
-		    inp->inp_rtableid)) == NULL)
-			return (EADDRNOTAVAIL);
-		sin6->sin6_port = lport;
+        sin6->sin6_port = 0;  /*
+                               * Yechhhh, because of upcoming
+                               * call to ifa_ifwithaddr(), which
+                               * does bcmp's over the PORTS as
+                               * well.  (What about flow?)
+                               */
+        sin6->sin6_flowinfo = 0;
+        if (!(so->so_options & SO_BINDANY) &&
+            (ifa = ifa_ifwithaddr(sin6tosa(sin6),
+            inp->inp_rtableid)) == NULL)
+            return (EADDRNOTAVAIL);
+        sin6->sin6_port = lport;
 
-		/*
-		 * bind to an anycast address might accidentally
-		 * cause sending a packet with an anycast source
-		 * address, so we forbid it.
-		 *
-		 * We should allow to bind to a deprecated address,
-		 * since the application dare to use it.
-		 * But, can we assume that they are careful enough
-		 * to check if the address is deprecated or not?
-		 * Maybe, as a safeguard, we should have a setsockopt
-		 * flag to control the bind(2) behavior against
-		 * deprecated addresses (default: forbid bind(2)).
-		 */
-		if (ifa && ifatoia6(ifa)->ia6_flags & (IN6_IFF_ANYCAST|
-		    IN6_IFF_TENTATIVE|IN6_IFF_DUPLICATED|IN6_IFF_DETACHED))
-			return (EADDRNOTAVAIL);
-	}
-	if (lport) {
-		struct inpcb *t;
-		int error = 0;
+        /*
+         * bind to an anycast address might accidentally
+         * cause sending a packet with an anycast source
+         * address, so we forbid it.
+         *
+         * We should allow to bind to a deprecated address,
+         * since the application dare to use it.
+         * But, can we assume that they are careful enough
+         * to check if the address is deprecated or not?
+         * Maybe, as a safeguard, we should have a setsockopt
+         * flag to control the bind(2) behavior against
+         * deprecated addresses (default: forbid bind(2)).
+         */
+        if (ifa && ifatoia6(ifa)->ia6_flags & (IN6_IFF_ANYCAST|
+            IN6_IFF_TENTATIVE|IN6_IFF_DUPLICATED|IN6_IFF_DETACHED))
+            return (EADDRNOTAVAIL);
+    }
+    if (lport) {
+        struct inpcb *t;
+        int error = 0;
 
-		if (so->so_euid && !IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
-			t = in_pcblookup_local_lock(table, &sin6->sin6_addr,
-			    lport, INPLOOKUP_WILDCARD | INPLOOKUP_IPV6,
-			    inp->inp_rtableid, lock);
-			if (t && (so->so_euid != t->inp_socket->so_euid))
-				error = EADDRINUSE;
-			if (lock == IN_PCBLOCK_GRAB)
-				in_pcbunref(t);
-			if (error)
-				return (error);
-		}
-		t = in_pcblookup_local_lock(table, &sin6->sin6_addr, lport,
-		    wild, inp->inp_rtableid, lock);
-		if (t && (reuseport & t->inp_socket->so_options) == 0)
-			error = EADDRINUSE;
-		if (lock == IN_PCBLOCK_GRAB)
-			in_pcbunref(t);
-		if (error)
-			return (error);
-	}
-	return (0);
+        if (so->so_euid && !IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
+            t = in_pcblookup_local_lock(table, &sin6->sin6_addr,
+                lport, INPLOOKUP_WILDCARD | INPLOOKUP_IPV6,
+                inp->inp_rtableid, lock);
+            if (t && (so->so_euid != t->inp_socket->so_euid))
+                error = EADDRINUSE;
+            if (lock == IN_PCBLOCK_GRAB)
+                in_pcbunref(t);
+            if (error)
+                return (error);
+        }
+        t = in_pcblookup_local_lock(table, &sin6->sin6_addr, lport,
+            wild, inp->inp_rtableid, lock);
+        if (t && (reuseport & t->inp_socket->so_options) == 0)
+            error = EADDRINUSE;
+        if (lock == IN_PCBLOCK_GRAB)
+            in_pcbunref(t);
+        if (error)
+            return (error);
+    }
+    return (0);
 }
 
 int
 in6_pcbaddrisavail(const struct inpcb *inp, struct sockaddr_in6 *sin6,
     int wild, struct proc *p)
 {
-	return in6_pcbaddrisavail_lock(inp, sin6, wild, p, IN_PCBLOCK_GRAB);
+    if (inp == NULL || sin6 == NULL || p == NULL) {
+        return 0; // Handle null pointers gracefully
+    }
+
+    if (wild < 0 || wild > 1) {
+        return 0; // Ensure 'wild' is within expected range
+    }
+
+    return in6_pcbaddrisavail_lock(inp, sin6, wild, p, IN_PCBLOCK_GRAB);
 }
 
 /*
@@ -329,6 +347,17 @@ in6_pcbconnect(struct inpcb *inp, struct mbuf *nam)
 		}
 		inp->inp_laddr6 = *in6a;
 	}
+
+	/* Ensure no integer overflow in assignment */
+	if (sin6->sin6_port > UINT16_MAX || sin6->sin6_port < 0) {
+		mtx_leave(&table->inpt_mtx);
+		return (EINVAL);
+	}
+	if (inp->inp_fport > UINT16_MAX || inp->inp_fport < 0) {
+		mtx_leave(&table->inpt_mtx);
+		return (EINVAL);
+	}
+
 	inp->inp_faddr6 = sin6->sin6_addr;
 	inp->inp_fport = sin6->sin6_port;
 	in_pcbrehash(inp);
@@ -355,10 +384,20 @@ in6_setsockaddr(struct inpcb *inp, struct mbuf *nam)
 {
 	struct sockaddr_in6 *sin6;
 
-	nam->m_len = sizeof(struct sockaddr_in6);
-	sin6 = mtod(nam,struct sockaddr_in6 *);
+	/* Validate input pointers */
+	if (inp == NULL || nam == NULL || nam->m_len < (int)sizeof(struct sockaddr_in6)) {
+		return;
+	}
 
-	bzero ((caddr_t)sin6,sizeof(struct sockaddr_in6));
+	nam->m_len = sizeof(struct sockaddr_in6);
+	sin6 = mtod(nam, struct sockaddr_in6 *);
+
+	/* Validate mtod conversion */
+	if (sin6 == NULL) {
+		return;
+	}
+
+	bzero((caddr_t)sin6, sizeof(struct sockaddr_in6));
 	sin6->sin6_family = AF_INET6;
 	sin6->sin6_len = sizeof(struct sockaddr_in6);
 	sin6->sin6_port = inp->inp_lport;
@@ -376,10 +415,22 @@ in6_setpeeraddr(struct inpcb *inp, struct mbuf *nam)
 {
 	struct sockaddr_in6 *sin6;
 
-	nam->m_len = sizeof(struct sockaddr_in6);
-	sin6 = mtod(nam,struct sockaddr_in6 *);
+	if (nam == NULL || inp == NULL) {
+		return; // Avoid NULL pointer dereference
+	}
 
-	bzero ((caddr_t)sin6,sizeof(struct sockaddr_in6));
+	if (nam->m_len < sizeof(struct sockaddr_in6)) {
+		return; // Avoid buffer overflow
+	}
+
+	nam->m_len = sizeof(struct sockaddr_in6);
+	sin6 = mtod(nam, struct sockaddr_in6 *);
+
+	if (sin6 == NULL) {
+		return; // Ensure mtod didn't return a NULL pointer
+	}
+
+	bzero((caddr_t)sin6, sizeof(struct sockaddr_in6));
 	sin6->sin6_family = AF_INET6;
 	sin6->sin6_len = sizeof(struct sockaddr_in6);
 	sin6->sin6_port = inp->inp_fport;
@@ -393,7 +444,15 @@ in6_sockaddr(struct socket *so, struct mbuf *nam)
 {
 	struct inpcb *inp;
 
+	if (so == NULL || nam == NULL) {
+		return (-1);
+	}
+
 	inp = sotoinpcb(so);
+	if (inp == NULL) {
+		return (-1);
+	}
+
 	in6_setsockaddr(inp, nam);
 
 	return (0);
@@ -404,7 +463,16 @@ in6_peeraddr(struct socket *so, struct mbuf *nam)
 {
 	struct inpcb *inp;
 
+	if (so == NULL || nam == NULL)
+		return (-1);
+
 	inp = sotoinpcb(so);
+	if (inp == NULL)
+		return (-1);
+
+	if (nam->m_len < sizeof(struct sockaddr_in6))
+		return (-1);
+
 	in6_setpeeraddr(inp, nam);
 
 	return (0);
@@ -565,11 +633,24 @@ in6_pcbrtentry(struct inpcb *inp)
 
 	if (IN6_IS_ADDR_UNSPECIFIED(&inp->inp_faddr6))
 		return (NULL);
-	if (route6_cache(ro, &inp->inp_faddr6, &inp->inp_laddr6,
-	    inp->inp_rtableid)) {
-		ro->ro_rt = rtalloc_mpath(&ro->ro_dstsa,
-		    &inp->inp_laddr6.s6_addr32[0], ro->ro_tableid);
+
+	if (route6_cache(ro, &inp->inp_faddr6, &inp->inp_laddr6, inp->inp_rtableid)) {
+		// Ensure ro_tableid is within valid range
+		if (ro->ro_tableid < 0 || ro->ro_tableid > INT_MAX) {
+			return (NULL);
+		}
+
+		// Ensure inp_laddr6.s6_addr32 array access is within bounds
+		for (int i = 0; i < 4; i++) {
+			if (inp->inp_laddr6.s6_addr32[i] > UINT32_MAX) {
+				return (NULL);
+			}
+		}
+		
+		// Perform rtalloc_mpath with validated parameters
+		ro->ro_rt = rtalloc_mpath(&ro->ro_dstsa, &inp->inp_laddr6.s6_addr32[0], ro->ro_tableid);
 	}
+
 	return (ro->ro_rt);
 }
 
@@ -584,7 +665,16 @@ in6_pcbhash_lookup(struct inpcbtable *table, uint64_t hash, u_int rdomain,
 	NET_ASSERT_LOCKED();
 	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 
+	/* Ensure hash does not exceed the table bounds */
+	if (hash >= UINT64_MAX || table == NULL || table->inpt_hashtbl == NULL) {
+		return NULL;
+	}
+
 	head = &table->inpt_hashtbl[hash & table->inpt_mask];
+	if (head == NULL) {
+	    return NULL;
+	}
+
 	LIST_FOREACH(inp, head, inp_hash) {
 		if (!ISSET(inp->inp_flags, INP_IPV6))
 			continue;
@@ -618,6 +708,14 @@ in6_pcblookup_lock(struct inpcbtable *table, const struct in6_addr *faddr,
 	uint64_t hash;
 	u_int rdomain;
 
+	if (table == NULL || faddr == NULL || laddr == NULL) {
+		return NULL;
+	}
+	
+	if (fport > UINT16_MAX || lport > UINT16_MAX) {
+		return NULL;
+	}
+
 	rdomain = rtable_l2(rtable);
 	hash = in6_pcbhash(table, rdomain, faddr, fport, laddr, lport);
 
@@ -627,10 +725,11 @@ in6_pcblookup_lock(struct inpcbtable *table, const struct in6_addr *faddr,
 		KASSERT(lock == IN_PCBLOCK_HOLD);
 		MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 	}
-	inp = in6_pcbhash_lookup(table, hash, rdomain,
-	    faddr, fport, laddr, lport);
+	inp = in6_pcbhash_lookup(table, hash, rdomain, faddr, fport, laddr, lport);
 	if (lock == IN_PCBLOCK_GRAB) {
-		in_pcbref(inp);
+		if (inp != NULL) {
+			in_pcbref(inp);
+		}
 		mtx_leave(&table->inpt_mtx);
 	}
 
@@ -647,69 +746,88 @@ struct inpcb *
 in6_pcblookup(struct inpcbtable *table, const struct in6_addr *faddr,
     u_int fport, const struct in6_addr *laddr, u_int lport, u_int rtable)
 {
-	return in6_pcblookup_lock(table, faddr, fport, laddr, lport, rtable,
-	    IN_PCBLOCK_GRAB);
+    if (table == NULL || faddr == NULL || laddr == NULL) {
+        return NULL;
+    }
+    if (fport > UINT_MAX || lport > UINT_MAX || rtable > UINT_MAX) {
+        return NULL;
+    }
+    return in6_pcblookup_lock(table, faddr, fport, laddr, lport, rtable,
+        IN_PCBLOCK_GRAB);
 }
 
 struct inpcb *
 in6_pcblookup_listen(struct inpcbtable *table, struct in6_addr *laddr,
     u_int lport, struct mbuf *m, u_int rtable)
 {
-	const struct in6_addr *key1, *key2;
-	struct inpcb *inp;
-	uint64_t hash;
-	u_int rdomain;
+    const struct in6_addr *key1, *key2;
+    struct inpcb *inp;
+    uint64_t hash;
+    u_int rdomain;
 
-	key1 = laddr;
-	key2 = &zeroin6_addr;
+    if (table == NULL || laddr == NULL) {
+        return NULL; // Ensure table and laddr are not NULL
+    }
+    
+    if (lport > 65535) {
+        return NULL; // Ensure lport is within valid range
+    }
+
+    key1 = laddr;
+    key2 = &zeroin6_addr;
 #if NPF > 0
-	if (m && m->m_pkthdr.pf.flags & PF_TAG_DIVERTED) {
-		struct pf_divert *divert;
+    if (m && m->m_pkthdr.pf.flags & PF_TAG_DIVERTED) {
+        struct pf_divert *divert;
 
-		divert = pf_find_divert(m);
-		KASSERT(divert != NULL);
-		switch (divert->type) {
-		case PF_DIVERT_TO:
-			key1 = key2 = &divert->addr.v6;
-			lport = divert->port;
-			break;
-		case PF_DIVERT_REPLY:
-			return (NULL);
-		default:
-			panic("%s: unknown divert type %d, mbuf %p, divert %p",
-			    __func__, divert->type, m, divert);
-		}
-	} else if (m && m->m_pkthdr.pf.flags & PF_TAG_TRANSLATE_LOCALHOST) {
-		/*
-		 * Redirected connections should not be treated the same
-		 * as connections directed to ::1 since localhost
-		 * can only be accessed from the host itself.
-		 */
-		key1 = &zeroin6_addr;
-		key2 = laddr;
-	}
+        divert = pf_find_divert(m);
+        KASSERT(divert != NULL);
+        switch (divert->type) {
+        case PF_DIVERT_TO:
+            key1 = key2 = &divert->addr.v6;
+            lport = divert->port;
+            if (lport > 65535) {
+                return NULL; // Ensure lport is within valid range after diversion
+            }
+            break;
+        case PF_DIVERT_REPLY:
+            return (NULL);
+        default:
+            panic("%s: unknown divert type %d, mbuf %p, divert %p",
+                __func__, divert->type, m, divert);
+        }
+    } else if (m && m->m_pkthdr.pf.flags & PF_TAG_TRANSLATE_LOCALHOST) {
+        /*
+         * Redirected connections should not be treated the same
+         * as connections directed to ::1 since localhost
+         * can only be accessed from the host itself.
+         */
+        key1 = &zeroin6_addr;
+        key2 = laddr;
+    }
 #endif
 
-	rdomain = rtable_l2(rtable);
-	hash = in6_pcbhash(table, rdomain, &zeroin6_addr, 0, key1, lport);
+    rdomain = rtable_l2(rtable);
+    hash = in6_pcbhash(table, rdomain, &zeroin6_addr, 0, key1, lport);
 
-	mtx_enter(&table->inpt_mtx);
-	inp = in6_pcbhash_lookup(table, hash, rdomain,
-	    &zeroin6_addr, 0, key1, lport);
-	if (inp == NULL && ! IN6_ARE_ADDR_EQUAL(key1, key2)) {
-		hash = in6_pcbhash(table, rdomain,
-		    &zeroin6_addr, 0, key2, lport);
-		inp = in6_pcbhash_lookup(table, hash, rdomain,
-		    &zeroin6_addr, 0, key2, lport);
-	}
-	in_pcbref(inp);
-	mtx_leave(&table->inpt_mtx);
+    mtx_enter(&table->inpt_mtx);
+    inp = in6_pcbhash_lookup(table, hash, rdomain,
+        &zeroin6_addr, 0, key1, lport);
+    if (inp == NULL && ! IN6_ARE_ADDR_EQUAL(key1, key2)) {
+        hash = in6_pcbhash(table, rdomain,
+            &zeroin6_addr, 0, key2, lport);
+        inp = in6_pcbhash_lookup(table, hash, rdomain,
+            &zeroin6_addr, 0, key2, lport);
+    }
+    if (inp != NULL) {
+        in_pcbref(inp);
+    }
+    mtx_leave(&table->inpt_mtx);
 
 #ifdef DIAGNOSTIC
-	if (inp == NULL && in_pcbnotifymiss) {
-		printf("%s: laddr= lport=%d rdom=%u\n",
-		    __func__, ntohs(lport), rdomain);
-	}
+    if (inp == NULL && in_pcbnotifymiss) {
+        printf("%s: laddr= lport=%d rdom=%u\n",
+            __func__, ntohs(lport), rdomain);
+    }
 #endif
-	return (inp);
+    return (inp);
 }

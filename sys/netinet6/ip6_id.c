@@ -135,17 +135,25 @@ ip6id_pmod(u_int32_t gen, u_int32_t expo, u_int32_t mod)
 {
 	u_int64_t s, t, u;
 
+	if (mod == 0) // Modulus must not be zero to avoid division by zero
+		return 0;
+		
 	s = 1;
 	t = gen;
 	u = expo;
 
 	while (u) {
-		if (u & 1)
+		if (u & 1) {
+			if (s > UINT64_MAX / t) // Check for potential overflow
+				return 0;
 			s = (s * t) % mod;
+		}
 		u >>= 1;
+		if (t > UINT64_MAX / t) // Check for potential overflow
+			return 0;
 		t = (t * t) % mod;
 	}
-	return (s);
+	return (u_int32_t)s;
 }
 
 /*
@@ -215,10 +223,20 @@ ip6id_randomid(struct randomtab *p)
 
 	for (i = 0; i <= n; i++) {
 		/* Linear Congruential Generator */
-		p->ru_x = (u_int32_t)((u_int64_t)p->ru_a * p->ru_x + p->ru_b) % p->ru_m;
+		u_int64_t new_x = (u_int64_t)p->ru_a * p->ru_x + p->ru_b;
+		/* Ensure no overflow on new_x */
+		if (new_x >= p->ru_m) {
+			new_x = new_x % p->ru_m;
+		}
+		p->ru_x = (u_int32_t)new_x;
 	}
 
-	p->ru_counter += i;
+	/* Ensure no overflow on ru_counter */
+	if (p->ru_counter > p->ru_max - i) {
+		p->ru_counter = p->ru_max;
+	} else {
+		p->ru_counter += i;
+	}
 
 	return (p->ru_seed ^ ip6id_pmod(p->ru_g, p->ru_seed2 + p->ru_x, p->ru_n)) |
 	    p->ru_msb;
@@ -227,6 +245,10 @@ ip6id_randomid(struct randomtab *p)
 u_int32_t
 ip6_randomflowlabel(void)
 {
-	return ip6id_randomid(&randomtab_20) & 0xfffff;
+	u_int32_t random_value = ip6id_randomid(&randomtab_20);
+	if (random_value > 0xfffff) {
+		random_value &= 0xfffff;
+	}
+	return random_value;
 }
 

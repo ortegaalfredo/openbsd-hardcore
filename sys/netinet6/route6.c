@@ -58,6 +58,10 @@ route6_input(struct mbuf **mp, int *offp, int proto, int af)
 	struct ip6_rthdr *rh;
 	int off = *offp, rhlen;
 
+	if (off < 0 || off + sizeof(*rh) > m->m_len) {
+		ip6stat_inc(ip6s_tooshort);
+		return IPPROTO_DONE;
+	}
 	ip6 = mtod(m, struct ip6_hdr *);
 	IP6_EXTHDR_GET(rh, struct ip6_rthdr *, m, off, sizeof(*rh));
 	if (rh == NULL) {
@@ -76,6 +80,10 @@ route6_input(struct mbuf **mp, int *offp, int proto, int af)
 		/* unknown routing type */
 		if (rh->ip6r_segleft == 0) {
 			rhlen = (rh->ip6r_len + 1) << 3;
+			if (rhlen < 0 || off + rhlen > m->m_len) {
+				ip6stat_inc(ip6s_tooshort);
+				return IPPROTO_DONE;
+			}
 			break;	/* Final dst. Just ignore the header. */
 		}
 		ip6stat_inc(ip6s_badoptions);

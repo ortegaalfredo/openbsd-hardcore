@@ -240,6 +240,9 @@ in6_selectsrc(const struct in6_addr **in6src, struct sockaddr_in6 *dstsock,
 	struct in6_addr *dst;
 	struct in6_ifaddr *ia6 = NULL;
 
+	if (dstsock == NULL || in6src == NULL)
+		return (EINVAL); // Ensure dstsock and in6src are not NULL
+
 	dst = &dstsock->sin6_addr;
 
 	/*
@@ -305,6 +308,9 @@ in6_selectroute(const struct in6_addr *dst, struct ip6_pktopts *opts,
 	 */
 	if (ro) {
 		if (route6_cache(ro, dst, NULL, rtableid)) {
+			if ((uintptr_t)ro->ro_tableid < (uintptr_t)0 || (uintptr_t)ro->ro_tableid > UINT_MAX) {
+				return NULL;
+			}
 			/* No route yet, so try to acquire one */
 			ro->ro_rt = rtalloc_mpath(&ro->ro_dstsa, NULL,
 			    ro->ro_tableid);
@@ -389,7 +395,7 @@ in6_selectif(const struct in6_addr *dst, struct ip6_pktopts *opts,
 int
 in6_selecthlim(const struct inpcb *inp)
 {
-	if (inp && inp->inp_hops >= 0)
+	if (inp && inp->inp_hops >= 0 && inp->inp_hops <= 255)
 		return (inp->inp_hops);
 
 	return (ip6_defhlim);
@@ -415,6 +421,10 @@ in6_embedscope(struct in6_addr *in6, const struct sockaddr_in6 *sin6,
     const struct ip6_pktopts *outputopts6, const struct ip6_moptions *moptions6)
 {
 	u_int32_t scopeid;
+
+	if (in6 == NULL || sin6 == NULL) {
+		return EINVAL;
+	}
 
 	*in6 = sin6->sin6_addr;
 
@@ -442,6 +452,11 @@ in6_embedscope(struct in6_addr *in6, const struct sockaddr_in6 *sin6,
 		if (scopeid) {
 			struct ifnet *ifp;
 
+			// Ensure scopeid does not exceed 16-bit limit
+			if (scopeid > 0xFFFF) {
+				return EINVAL;
+			}
+
 			ifp = if_get(scopeid);
 			if (ifp == NULL)
 				return ENXIO;  /* XXX EINVAL? */
@@ -464,26 +479,29 @@ in6_embedscope(struct in6_addr *in6, const struct sockaddr_in6 *sin6,
 void
 in6_recoverscope(struct sockaddr_in6 *sin6, const struct in6_addr *in6)
 {
-	u_int32_t scopeid;
+    u_int32_t scopeid;
 
-	sin6->sin6_addr = *in6;
+    if (sin6 == NULL || in6 == NULL)
+        return;
 
-	/*
-	 * don't try to read *in6 beyond here, since the caller may
-	 * ask us to overwrite existing sockaddr_in6
-	 */
+    sin6->sin6_addr = *in6;
 
-	sin6->sin6_scope_id = 0;
-	if (IN6_IS_SCOPE_EMBED(in6)) {
-		/*
-		 * KAME assumption: link id == interface id
-		 */
-		scopeid = ntohs(sin6->sin6_addr.s6_addr16[1]);
-		if (scopeid) {
-			sin6->sin6_addr.s6_addr16[1] = 0;
-			sin6->sin6_scope_id = scopeid;
-		}
-	}
+    /*
+     * don't try to read *in6 beyond here, since the caller may
+     * ask us to overwrite existing sockaddr_in6
+     */
+
+    sin6->sin6_scope_id = 0;
+    if (IN6_IS_SCOPE_EMBED(in6)) {
+        /*
+         * KAME assumption: link id == interface id
+         */
+        scopeid = ntohs(sin6->sin6_addr.s6_addr16[1]);
+        if (scopeid) {
+            sin6->sin6_addr.s6_addr16[1] = 0;
+            sin6->sin6_scope_id = scopeid;
+        }
+    }
 }
 
 /*
@@ -492,6 +510,8 @@ in6_recoverscope(struct sockaddr_in6 *sin6, const struct in6_addr *in6)
 void
 in6_clearscope(struct in6_addr *addr)
 {
+	if (addr == NULL) return;
 	if (IN6_IS_SCOPE_EMBED(addr))
-		addr->s6_addr16[1] = 0;
+		if ((uintptr_t)addr->s6_addr16 + sizeof(addr->s6_addr16[1]) <= (uintptr_t)((uint8_t*)addr + sizeof(struct in6_addr)))
+			addr->s6_addr16[1] = 0;
 }

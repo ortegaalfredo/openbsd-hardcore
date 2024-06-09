@@ -95,7 +95,16 @@ mld6_init(void)
 {
 	static u_int8_t hbh_buf[8];
 	struct ip6_hbh *hbh = (struct ip6_hbh *)hbh_buf;
-	u_int16_t rtalert_code = htons((u_int16_t)IP6OPT_RTALERT_MLD);
+	u_int16_t rtalert_code;
+
+	if (sizeof(rtalert_code) != 2)
+		return; // Ensure that rtalert_code is the expected size
+
+	rtalert_code = htons((u_int16_t)IP6OPT_RTALERT_MLD);
+	
+	// Check for potential overflow in conversion
+	if (rtalert_code == 0 && IP6OPT_RTALERT_MLD != 0)
+		return;
 
 	mld6_timers_are_running = 0;
 
@@ -103,10 +112,23 @@ mld6_init(void)
 	hbh->ip6h_len = 0;	/* (8 >> 3) - 1 */
 
 	/* XXX: grotty hard coding... */
+	if (sizeof(hbh_buf) < 8)
+		return; // Ensure buffer size is as expected
+
 	hbh_buf[2] = IP6OPT_PADN;	/* 2 byte padding */
 	hbh_buf[3] = 0;
 	hbh_buf[4] = IP6OPT_ROUTER_ALERT;
+
+	// Ensure that IP6OPT_RTALERT_LEN - 2 does not result in negative value
+	if (IP6OPT_RTALERT_LEN < 2)
+		return;
+
 	hbh_buf[5] = IP6OPT_RTALERT_LEN - 2;
+
+	// Ensure there's enough space in hbh_buf for the memcpy
+	if (sizeof(hbh_buf) < 8 || sizeof(rtalert_code) != 2)
+		return;
+
 	memcpy(&hbh_buf[6], (caddr_t)&rtalert_code, sizeof(u_int16_t));
 
 	ip6_initpktopts(&ip6_opts);
@@ -126,6 +148,11 @@ mld6_start_listening(struct in6_multi *in6m)
 	 * MLD messages are never sent for multicast addresses whose scope is 0
 	 * (reserved) or 1 (node-local).
 	 */
+	if (in6m->in6m_ifidx < 0 || in6m->in6m_ifidx > 0xFFFF) {
+		/* Invalid interface index, avoid overflow */
+		return;
+	}
+
 	all_nodes.s6_addr16[1] = htons(in6m->in6m_ifidx);
 	if (IN6_ARE_ADDR_EQUAL(&in6m->in6m_addr, &all_nodes) ||
 	    __IPV6_ADDR_MC_SCOPE(&in6m->in6m_addr) <
@@ -145,19 +172,31 @@ mld6_start_listening(struct in6_multi *in6m)
 void
 mld6_stop_listening(struct in6_multi *in6m)
 {
+	/* Check for null pointer */
+	if (in6m == NULL) {
+		return;
+	}
+
 	/* XXX: These are necessary for KAME's link-local hack */
 	struct in6_addr all_nodes = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
 	struct in6_addr all_routers = IN6ADDR_LINKLOCAL_ALLROUTERS_INIT;
 
-	all_nodes.s6_addr16[1] = htons(in6m->in6m_ifidx);
-	/* XXX: necessary when mrouting */
-	all_routers.s6_addr16[1] = htons(in6m->in6m_ifidx);
+	/* Check for integer overflow before assigning */
+	if (in6m->in6m_ifidx >= 0 && in6m->in6m_ifidx <= UINT16_MAX) {
+		all_nodes.s6_addr16[1] = htons(in6m->in6m_ifidx);
+		/* XXX: necessary when mrouting */
+		all_routers.s6_addr16[1] = htons(in6m->in6m_ifidx);
+	} else {
+		return;
+	}
 
 	if (in6m->in6m_state == MLD_IREPORTEDLAST &&
 	    (!IN6_ARE_ADDR_EQUAL(&in6m->in6m_addr, &all_nodes)) &&
 	    __IPV6_ADDR_MC_SCOPE(&in6m->in6m_addr) >
 	    __IPV6_ADDR_SCOPE_INTFACELOCAL)
+	{
 		mld6_sendpkt(in6m, MLD_LISTENER_DONE, &all_routers);
+	}
 }
 
 void
@@ -346,8 +385,13 @@ mld6_fasttimeo(void)
 	NET_LOCK();
 
 	mld6_timers_are_running = 0;
-	TAILQ_FOREACH(ifp, &ifnetlist, if_list)
+	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
+		if (ifp == NULL) {
+			NET_UNLOCK();
+			return;
+		}
 		mld6_checktimer(ifp);
+	}
 
 	NET_UNLOCK();
 }
@@ -364,9 +408,11 @@ mld6_checktimer(struct ifnet *ifp)
 		if (ifma->ifma_addr->sa_family != AF_INET6)
 			continue;
 		in6m = ifmatoin6m(ifma);
+		if (in6m == NULL)
+			continue;
 		if (in6m->in6m_timer == 0) {
 			/* do nothing */
-		} else if (--in6m->in6m_timer == 0) {
+		} else if (in6m->in6m_timer > 0 && --in6m->in6m_timer == 0) {
 			mld6_sendpkt(in6m, MLD_LISTENER_REPORT, NULL);
 			in6m->in6m_state = MLD_IREPORTEDLAST;
 		} else {
@@ -386,17 +432,14 @@ mld6_sendpkt(struct in6_multi *in6m, int type, const struct in6_addr *dst)
 	struct ifnet *ifp;
 	int ignflags;
 
+	if (!in6m || type < 0 || type > 255 || !dst) 
+		return;
+
 	ifp = if_get(in6m->in6m_ifidx);
 	if (ifp == NULL)
 		return;
 
-	/*
-	 * At first, find a link local address on the outgoing interface
-	 * to use as the source address of the MLD packet.
-	 * We do not reject tentative addresses for MLD report to deal with
-	 * the case where we first join a link-local address.
-	 */
-	ignflags = IN6_IFF_DUPLICATED|IN6_IFF_ANYCAST;
+	ignflags = IN6_IFF_DUPLICATED | IN6_IFF_ANYCAST;
 	if ((ia6 = in6ifa_ifpforlinklocal(ifp, ignflags)) == NULL) {
 		if_put(ifp);
 		return;
@@ -404,11 +447,6 @@ mld6_sendpkt(struct in6_multi *in6m, int type, const struct in6_addr *dst)
 	if ((ia6->ia6_flags & IN6_IFF_TENTATIVE))
 		ia6 = NULL;
 
-	/*
-	 * Allocate mbufs to store ip6 header and MLD header.
-	 * We allocate 2 mbufs and make chain in advance because
-	 * it is more convenient when inserting the hop-by-hop option later.
-	 */
 	MGETHDR(mh, M_DONTWAIT, MT_HEADER);
 	if (mh == NULL) {
 		if_put(ifp);
@@ -422,52 +460,55 @@ mld6_sendpkt(struct in6_multi *in6m, int type, const struct in6_addr *dst)
 	}
 	mh->m_next = md;
 
+	if (sizeof(struct ip6_hdr) + sizeof(struct mld_hdr) > INT_MAX) {
+		m_free(md);
+		m_free(mh);
+		if_put(ifp);
+		return;
+	}
+
 	mh->m_pkthdr.ph_ifidx = 0;
 	mh->m_pkthdr.ph_rtableid = ifp->if_rdomain;
 	mh->m_pkthdr.len = sizeof(struct ip6_hdr) + sizeof(struct mld_hdr);
 	mh->m_len = sizeof(struct ip6_hdr);
 	m_align(mh, sizeof(struct ip6_hdr));
 
-	/* fill in the ip6 header */
 	ip6 = mtod(mh, struct ip6_hdr *);
 	ip6->ip6_flow = 0;
 	ip6->ip6_vfc &= ~IPV6_VERSION_MASK;
 	ip6->ip6_vfc |= IPV6_VERSION;
-	/* ip6_plen will be set later */
 	ip6->ip6_nxt = IPPROTO_ICMPV6;
-	/* ip6_hlim will be set by im6o.im6o_hlim */
 	ip6->ip6_src = ia6 ? ia6->ia_addr.sin6_addr : in6addr_any;
 	ip6->ip6_dst = dst ? *dst : in6m->in6m_addr;
 
-	/* fill in the MLD header */
+	if (sizeof(struct mld_hdr) > INT_MAX) {
+		m_free(md);
+		m_free(mh);
+		if_put(ifp);
+		return;
+	}
+
 	md->m_len = sizeof(struct mld_hdr);
 	mldh = mtod(md, struct mld_hdr *);
 	mldh->mld_type = type;
 	mldh->mld_code = 0;
 	mldh->mld_cksum = 0;
-	/* XXX: we assume the function will not be called for query messages */
 	mldh->mld_maxdelay = 0;
 	mldh->mld_reserved = 0;
 	mldh->mld_addr = in6m->in6m_addr;
 	if (IN6_IS_ADDR_MC_LINKLOCAL(&mldh->mld_addr))
-		mldh->mld_addr.s6_addr16[1] = 0; /* XXX */
+		mldh->mld_addr.s6_addr16[1] = 0;
 	mh->m_pkthdr.csum_flags |= M_ICMP_CSUM_OUT;
 
-	/* construct multicast option */
 	bzero(&im6o, sizeof(im6o));
 	im6o.im6o_ifidx = ifp->if_index;
 	im6o.im6o_hlim = 1;
 
-	/*
-	 * Request loopback of the report if we are acting as a multicast
-	 * router, so that the process-level routing daemon can hear it.
-	 */
 #ifdef MROUTING
 	im6o.im6o_loop = (ip6_mrouter[ifp->if_rdomain] != NULL);
 #endif
 	if_put(ifp);
 
 	icmp6stat_inc(icp6s_outhist + type);
-	ip6_output(mh, &ip6_opts, NULL, ia6 ? 0 : IPV6_UNSPECSRC, &im6o,
-	    NULL);
+	ip6_output(mh, &ip6_opts, NULL, ia6 ? 0 : IPV6_UNSPECSRC, &im6o, NULL);
 }

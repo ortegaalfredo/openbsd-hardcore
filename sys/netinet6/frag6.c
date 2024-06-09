@@ -70,9 +70,17 @@ struct pool ip6q_pool;
 void
 frag6_init(void)
 {
-	pool_init(&ip6af_pool, sizeof(struct ip6asfrag),
+	size_t ip6asfrag_size = sizeof(struct ip6asfrag);
+	size_t ip6q_size = sizeof(struct ip6q);
+	if (ip6asfrag_size == 0 || ip6asfrag_size > SIZE_MAX / 2 ||
+	    ip6q_size == 0 || ip6q_size > SIZE_MAX / 2) {
+		/* Handle error or return */
+		return;
+	}
+
+	pool_init(&ip6af_pool, ip6asfrag_size,
 	    0, IPL_SOFTNET, 0, "ip6af", NULL);
-	pool_init(&ip6q_pool, sizeof(struct ip6q),
+	pool_init(&ip6q_pool, ip6q_size,
 	    0, IPL_SOFTNET, 0, "ip6q", NULL);
 
 	TAILQ_INIT(&frag6_queue);
@@ -490,15 +498,23 @@ frag6_deletefraghdr(struct mbuf *m, int offset)
 {
 	struct mbuf *t;
 
+	if (m == NULL || offset < 0 || offset > m->m_len || m->m_len < 0 || m->m_len > INT_MAX - sizeof(struct ip6_frag)) {
+		return (EINVAL);  // Invalid argument
+	}
+
 	if (m->m_len >= offset + sizeof(struct ip6_frag)) {
+		if (m->m_len < offset || m->m_len - offset < sizeof(struct ip6_frag)) {
+			return (EINVAL);  // Prevent integer overflow
+		}
 		memmove(mtod(m, caddr_t) + sizeof(struct ip6_frag),
-		    mtod(m, caddr_t), offset);
+		        mtod(m, caddr_t), offset);
 		m->m_data += sizeof(struct ip6_frag);
 		m->m_len -= sizeof(struct ip6_frag);
 	} else {
 		/* this comes with no copy if the boundary is on cluster */
-		if ((t = m_split(m, offset, M_DONTWAIT)) == NULL)
+		if ((t = m_split(m, offset, M_DONTWAIT)) == NULL) {
 			return (ENOBUFS);
+		}
 		m_adj(t, sizeof(struct ip6_frag));
 		m_cat(m, t);
 	}
@@ -532,15 +548,20 @@ frag6_freef(struct ip6q *q6)
 			ip6 = mtod(m, struct ip6_hdr *);
 
 			/* restore source and destination addresses */
-			ip6->ip6_src = q6->ip6q_src;
-			ip6->ip6_dst = q6->ip6q_dst;
+			if (ip6 != NULL) {
+				ip6->ip6_src = q6->ip6q_src;
+				ip6->ip6_dst = q6->ip6q_dst;
 
-			NET_LOCK();
-			icmp6_error(m, ICMP6_TIME_EXCEEDED,
-				    ICMP6_TIME_EXCEED_REASSEMBLY, 0);
-			NET_UNLOCK();
-		} else
-			m_freem(m);
+				NET_LOCK();
+				icmp6_error(m, ICMP6_TIME_EXCEEDED,
+					    ICMP6_TIME_EXCEED_REASSEMBLY, 0);
+				NET_UNLOCK();
+			}
+		} else {
+			if (m != NULL) {
+				m_freem(m);
+			}
+		}
 		pool_put(&ip6af_pool, af6);
 	}
 	pool_put(&ip6q_pool, q6);
@@ -555,10 +576,17 @@ frag6_unlink(struct ip6q *q6, struct ip6q_head *rmq6)
 {
 	MUTEX_ASSERT_LOCKED(&frag6_mutex);
 
+	if (q6 == NULL || rmq6 == NULL)
+		return;
+
 	TAILQ_REMOVE(&frag6_queue, q6, ip6q_queue);
 	TAILQ_INSERT_HEAD(rmq6, q6, ip6q_queue);
-	frag6_nfrags -= q6->ip6q_nfrag;
-	frag6_nfragpackets--;
+	if (frag6_nfrags >= q6->ip6q_nfrag)
+		frag6_nfrags -= q6->ip6q_nfrag;
+	else
+		frag6_nfrags = 0;
+	if (frag6_nfragpackets > 0)
+		frag6_nfragpackets--;
 }
 
 /*
@@ -569,35 +597,35 @@ frag6_unlink(struct ip6q *q6, struct ip6q_head *rmq6)
 void
 frag6_slowtimo(void)
 {
-	struct ip6q_head rmq6;
-	struct ip6q *q6, *nq6;
+    struct ip6q_head rmq6;
+    struct ip6q *q6, *nq6;
 
-	TAILQ_INIT(&rmq6);
+    TAILQ_INIT(&rmq6);
 
-	mtx_enter(&frag6_mutex);
+    mtx_enter(&frag6_mutex);
 
-	TAILQ_FOREACH_SAFE(q6, &frag6_queue, ip6q_queue, nq6) {
-		if (--q6->ip6q_ttl == 0) {
-			ip6stat_inc(ip6s_fragtimeout);
-			frag6_unlink(q6, &rmq6);
-		}
-	}
+    TAILQ_FOREACH_SAFE(q6, &frag6_queue, ip6q_queue, nq6) {
+        if (q6->ip6q_ttl > 0 && --q6->ip6q_ttl == 0) {
+            ip6stat_inc(ip6s_fragtimeout);
+            frag6_unlink(q6, &rmq6);
+        }
+    }
 
-	/*
-	 * If we are over the maximum number of fragments
-	 * (due to the limit being lowered), drain off
-	 * enough to get down to the new limit.
-	 */
-	while (frag6_nfragpackets > (u_int)ip6_maxfragpackets &&
-	    !TAILQ_EMPTY(&frag6_queue)) {
-		ip6stat_inc(ip6s_fragoverflow);
-		frag6_unlink(TAILQ_LAST(&frag6_queue, ip6q_head), &rmq6);
-	}
+    /*
+     * If we are over the maximum number of fragments
+     * (due to the limit being lowered), drain off
+     * enough to get down to the new limit.
+     */
+    while (frag6_nfragpackets > (u_int)ip6_maxfragpackets &&
+        !TAILQ_EMPTY(&frag6_queue)) {
+        ip6stat_inc(ip6s_fragoverflow);
+        frag6_unlink(TAILQ_LAST(&frag6_queue, ip6q_head), &rmq6);
+    }
 
-	mtx_leave(&frag6_mutex);
+    mtx_leave(&frag6_mutex);
 
-	while ((q6 = TAILQ_FIRST(&rmq6)) != NULL) {
-		TAILQ_REMOVE(&rmq6, q6, ip6q_queue);
-		frag6_freef(q6);
-	}
+    while ((q6 = TAILQ_FIRST(&rmq6)) != NULL) {
+        TAILQ_REMOVE(&rmq6, q6, ip6q_queue);
+        frag6_freef(q6);
+    }
 }
