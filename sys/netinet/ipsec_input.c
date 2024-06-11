@@ -605,6 +605,11 @@ ipsec_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 {
 	int error;
 
+	// Check for out-of-bounds access and invalid namelen
+	if (name == NULL || namelen < 1) {
+		return (EINVAL); // Invalid argument
+	}
+
 	switch (name[0]) {
 	case IPCTL_IPSEC_ENC_ALGORITHM:
 		NET_LOCK();
@@ -645,6 +650,10 @@ esp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	if (namelen != 1)
 		return (ENOTDIR);
 
+	/* Check for null pointers and integer overflows */
+	if (name == NULL || (oldp == NULL && oldlenp != NULL) || newp == NULL || namelen > INT_MAX)
+		return (EINVAL);
+
 	switch (name[0]) {
 	case ESPCTL_STATS:
 		return (esp_sysctl_espstat(oldp, oldlenp, newp));
@@ -664,31 +673,48 @@ esp_sysctl_espstat(void *oldp, size_t *oldlenp, void *newp)
 
 	CTASSERT(sizeof(espstat) == (esps_ncounters * sizeof(uint64_t)));
 	memset(&espstat, 0, sizeof espstat);
+
+	// Check for potential integer overflow
+	if (esps_ncounters > SIZE_MAX / sizeof(uint64_t)) {
+		return -1; // Indicate an error condition
+	}
+
 	counters_read(espcounters, (uint64_t *)&espstat, esps_ncounters, NULL);
-	return (sysctl_rdstruct(oldp, oldlenp, newp, &espstat,
-	    sizeof(espstat)));
+
+	size_t espstat_size = sizeof(espstat);
+	if (*oldlenp < espstat_size || (oldp == NULL && *oldlenp != 0)) {
+		return -1; // Indicate an error condition
+	}
+
+	return (sysctl_rdstruct(oldp, oldlenp, newp, &espstat, espstat_size));
 }
 
 int
 ah_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-	int error;
+    int error;
 
-	/* All sysctl names at this level are terminal. */
-	if (namelen != 1)
-		return (ENOTDIR);
+    /* All sysctl names at this level are terminal. */
+    if (namelen != 1)
+        return (ENOTDIR);
 
-	switch (name[0]) {
-	case AHCTL_STATS:
-		return ah_sysctl_ahstat(oldp, oldlenp, newp);
-	default:
-		NET_LOCK();
-		error = sysctl_bounded_arr(ahctl_vars, nitems(ahctl_vars), name,
-		    namelen, oldp, oldlenp, newp, newlen);
-		NET_UNLOCK();
-		return (error);
-	}
+    if (name == NULL || oldlenp == NULL)
+        return (EINVAL);
+
+    if ((oldp != NULL && *oldlenp > SIZE_MAX) || newlen > SIZE_MAX)
+        return (EOVERFLOW);
+
+    switch (name[0]) {
+    case AHCTL_STATS:
+        return ah_sysctl_ahstat(oldp, oldlenp, newp);
+    default:
+        NET_LOCK();
+        error = sysctl_bounded_arr(ahctl_vars, nitems(ahctl_vars), name,
+            namelen, oldp, oldlenp, newp, newlen);
+        NET_UNLOCK();
+        return (error);
+    }
 }
 
 int
@@ -696,7 +722,12 @@ ah_sysctl_ahstat(void *oldp, size_t *oldlenp, void *newp)
 {
 	struct ahstat ahstat;
 
-	CTASSERT(sizeof(ahstat) == (ahs_ncounters * sizeof(uint64_t)));
+	if (sizeof(ahstat) != (ahs_ncounters * sizeof(uint64_t))) {
+		return -1; // or an appropriate error code
+	}
+	if (oldlenp == NULL || *oldlenp < sizeof(ahstat)) {
+		return -1; // or an appropriate error code
+	}
 	memset(&ahstat, 0, sizeof ahstat);
 	counters_read(ahcounters, (uint64_t *)&ahstat, ahs_ncounters, NULL);
 	return (sysctl_rdstruct(oldp, oldlenp, newp, &ahstat, sizeof(ahstat)));
@@ -711,6 +742,9 @@ ipcomp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
+
+	if (name == NULL || (oldlenp == NULL && oldp != NULL) || (oldlenp != NULL && oldp == NULL))
+		return (EINVAL);
 
 	switch (name[0]) {
 	case IPCOMPCTL_STATS:
@@ -729,41 +763,72 @@ int
 ipcomp_sysctl_ipcompstat(void *oldp, size_t *oldlenp, void *newp)
 {
 	struct ipcompstat ipcompstat;
+	size_t ipcompstat_size;
 
 	CTASSERT(sizeof(ipcompstat) == (ipcomps_ncounters * sizeof(uint64_t)));
-	memset(&ipcompstat, 0, sizeof ipcompstat);
-	counters_read(ipcompcounters, (uint64_t *)&ipcompstat,
-	    ipcomps_ncounters, NULL);
-	return (sysctl_rdstruct(oldp, oldlenp, newp, &ipcompstat,
-	    sizeof(ipcompstat)));
+	ipcompstat_size = sizeof(ipcompstat);
+
+	// Check for integer overflow in memset size
+	if (ipcompstat_size != ipcomps_ncounters * sizeof(uint64_t))
+		return -1; 
+
+	memset(&ipcompstat, 0, ipcompstat_size);
+
+	// Check for overflow in the counters_read function arguments
+	if (ipcomps_ncounters > SIZE_MAX / sizeof(uint64_t))
+		return -1; 
+	
+	counters_read(ipcompcounters, (uint64_t *)&ipcompstat, ipcomps_ncounters, NULL);
+
+	// Check oldlenp for NULL before dereferencing
+	if (oldlenp == NULL)
+		return -1;
+
+	// Ensure sysctl_rdstruct does not read/write out-of-bounds
+	if (*oldlenp < ipcompstat_size)
+		return -1;
+
+	return (sysctl_rdstruct(oldp, oldlenp, newp, &ipcompstat, ipcompstat_size));
 }
 
 int
 ipsec_sysctl_ipsecstat(void *oldp, size_t *oldlenp, void *newp)
 {
-	struct ipsecstat ipsecstat;
+    struct ipsecstat ipsecstat;
 
-	CTASSERT(sizeof(ipsecstat) == (ipsec_ncounters * sizeof(uint64_t)));
-	memset(&ipsecstat, 0, sizeof ipsecstat);
-	counters_read(ipseccounters, (uint64_t *)&ipsecstat, ipsec_ncounters,
-	    NULL);
-	return (sysctl_rdstruct(oldp, oldlenp, newp, &ipsecstat,
-	    sizeof(ipsecstat)));
+    if (oldlenp == NULL || *oldlenp < sizeof(ipsecstat)) {
+        return -1; // or appropriate error code
+    }
+    CTASSERT(sizeof(ipsecstat) == (ipsec_ncounters * sizeof(uint64_t)));
+    memset(&ipsecstat, 0, sizeof ipsecstat);
+    counters_read(ipseccounters, (uint64_t *)&ipsecstat, ipsec_ncounters,
+        NULL);
+    return (sysctl_rdstruct(oldp, oldlenp, newp, &ipsecstat,
+        sizeof(ipsecstat)));
 }
 
 int
 ipsec_input_disabled(struct mbuf **mp, int *offp, int proto, int af)
 {
-	switch (af) {
-	case AF_INET:
-		return rip_input(mp, offp, proto, af);
+    switch (af) {
+    case AF_INET:
+        if (mp == NULL || offp == NULL || *offp < 0 || proto < 0 || proto > 255 || af < 0 || af > 255) {
+            return -1;  // Return an error code to indicate invalid input
+        }
+        return rip_input(mp, offp, proto, af);
 #ifdef INET6
-	case AF_INET6:
-		return rip6_input(mp, offp, proto, af);
+    case AF_INET6:
+        if (mp == NULL || offp == NULL || *offp < 0 || proto < 0 || proto > 255 || af < 0 || af > 255) {
+            return -1;  // Return an error code to indicate invalid input
+        }
+        return rip6_input(mp, offp, proto, af);
 #endif
-	default:
-		unhandled_af(af);
-	}
+    default:
+        if (af < 0 || af > 255) {
+            return -1;  // Return an error code to indicate invalid input
+        }
+        unhandled_af(af);
+    }
 }
 
 int
@@ -777,6 +842,22 @@ ah46_input(struct mbuf **mp, int *offp, int proto, int af)
 #endif
 	    !ah_enable)
 		return ipsec_input_disabled(mp, offp, proto, af);
+
+	// Check for null pointers
+	if (mp == NULL || *mp == NULL || offp == NULL) {
+		DPRINTF("null pointer encountered");
+		ahstat_inc(ahs_hdrops);
+		m_freemp(mp);
+		return IPPROTO_DONE;
+	}
+
+	// Check for valid offset values
+	if (*offp < 0 || *offp > (*mp)->m_pkthdr.len) {
+		DPRINTF("offset out of bounds");
+		ahstat_inc(ahs_hdrops);
+		m_freemp(mp);
+		return IPPROTO_DONE;
+	}
 
 	protoff = ipsec_protoff(*mp, *offp, af);
 	if (protoff < 0) {
@@ -792,8 +873,9 @@ ah46_input(struct mbuf **mp, int *offp, int proto, int af)
 void
 ah4_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 {
-	if (sa->sa_family != AF_INET ||
-	    sa->sa_len != sizeof(struct sockaddr_in))
+	if (sa == NULL || sa->sa_family != AF_INET ||
+	    sa->sa_len != sizeof(struct sockaddr_in) ||
+	    cmd < 0 || cmd > INT_MAX || rdomain > UINT_MAX)
 		return;
 
 	ipsec_common_ctlinput(rdomain, cmd, sa, v, IPPROTO_AH);
@@ -811,6 +893,14 @@ esp46_input(struct mbuf **mp, int *offp, int proto, int af)
 	    !esp_enable)
 		return ipsec_input_disabled(mp, offp, proto, af);
 
+	if (mp == NULL || *mp == NULL || offp == NULL || *offp < 0 || *offp > (*mp)->m_pkthdr.len) {
+		DPRINTF("invalid input parameters or offset");
+		espstat_inc(esps_hdrops);
+		if (mp && *mp)
+			m_freemp(mp);
+		return IPPROTO_DONE;
+	}
+	
 	protoff = ipsec_protoff(*mp, *offp, af);
 	if (protoff < 0) {
 		DPRINTF("bad packet header chain");
@@ -834,6 +924,19 @@ ipcomp46_input(struct mbuf **mp, int *offp, int proto, int af)
 #endif
 	    !ipcomp_enable)
 		return ipsec_input_disabled(mp, offp, proto, af);
+
+	if (mp == NULL || *mp == NULL || offp == NULL) {
+		DPRINTF("null pointer input");
+		ipcompstat_inc(ipcomps_hdrops);
+		return IPPROTO_DONE;
+	}
+
+	if (*offp < 0 || *offp >= (*mp)->m_pkthdr.len) {
+		DPRINTF("offset out of bounds");
+		ipcompstat_inc(ipcomps_hdrops);
+		m_freemp(mp);
+		return IPPROTO_DONE;
+	}
 
 	protoff = ipsec_protoff(*mp, *offp, af);
 	if (protoff < 0) {
@@ -859,6 +962,9 @@ ipsec_set_mtu(struct tdb *tdbp, u_int32_t mtu)
 		    (adjust = ipsec_hdrsz(tdbp)) == -1)
 			return;
 
+		if (adjust < 0 || (u_int32_t)adjust > mtu)  // Check for out-of-bounds and integer overflow
+			return;
+		
 		mtu -= adjust;
 
 		/* Store adjusted MTU in tdb */
@@ -873,39 +979,57 @@ void
 ipsec_common_ctlinput(u_int rdomain, int cmd, struct sockaddr *sa,
     void *v, int proto)
 {
-	struct ip *ip = v;
+    struct ip *ip = v;
 
-	if (cmd == PRC_MSGSIZE && ip && ip_mtudisc && ip->ip_v == 4) {
-		struct tdb *tdbp;
-		struct sockaddr_in dst;
-		struct icmp *icp;
-		int hlen = ip->ip_hl << 2;
-		u_int32_t spi, mtu;
+    if (cmd == PRC_MSGSIZE && ip && ip_mtudisc && ip->ip_v == 4) {
+        struct tdb *tdbp;
+        struct sockaddr_in dst;
+        struct icmp *icp;
+        int hlen = ip->ip_hl << 2;
+        u_int32_t spi, mtu;
 
-		/* Find the right MTU. */
-		icp = (struct icmp *)((caddr_t) ip -
-		    offsetof(struct icmp, icmp_ip));
-		mtu = ntohs(icp->icmp_nextmtu);
+        /* Prevent integer overflow on hlen calculation */
+        if (ip->ip_hl > (UINT_MAX / 4)) {
+            return;
+        }
 
-		/*
-		 * Ignore the packet, if we do not receive a MTU
-		 * or the MTU is too small to be acceptable.
-		 */
-		if (mtu < 296)
-			return;
+        /* Ensure hlen does not exceed the length of the IP packet */
+        if (hlen < sizeof(struct ip) || (hlen + sizeof(u_int32_t)) > ntohs(ip->ip_len)) {
+            return;
+        }
 
-		memset(&dst, 0, sizeof(struct sockaddr_in));
-		dst.sin_family = AF_INET;
-		dst.sin_len = sizeof(struct sockaddr_in);
-		dst.sin_addr.s_addr = ip->ip_dst.s_addr;
+        /* Ensure the ip buffer is large enough to contain an ICMP message */
+        if ((caddr_t) ip < (caddr_t)sizeof(struct icmp)) {
+            return;
+        }
 
-		memcpy(&spi, (caddr_t)ip + hlen, sizeof(u_int32_t));
+        /* Find the right MTU. */
+        icp = (struct icmp *)((caddr_t) ip - offsetof(struct icmp, icmp_ip));
+        mtu = ntohs(icp->icmp_nextmtu);
 
-		tdbp = gettdb_rev(rdomain, spi, (union sockaddr_union *)&dst,
-		    proto);
-		ipsec_set_mtu(tdbp, mtu);
-		tdb_unref(tdbp);
-	}
+        /*
+         * Ignore the packet, if we do not receive a MTU
+         * or the MTU is too small to be acceptable.
+         */
+        if (mtu < 296)
+            return;
+
+        memset(&dst, 0, sizeof(struct sockaddr_in));
+        dst.sin_family = AF_INET;
+        dst.sin_len = sizeof(struct sockaddr_in);
+        dst.sin_addr.s_addr = ip->ip_dst.s_addr;
+
+        /* Ensure no buffer overflow when copying SPI */
+        if ((hlen + sizeof(u_int32_t)) > ntohs(ip->ip_len)) {
+            return;
+        }
+
+        memcpy(&spi, (caddr_t)ip + hlen, sizeof(u_int32_t));
+
+        tdbp = gettdb_rev(rdomain, spi, (union sockaddr_union *)&dst, proto);
+        ipsec_set_mtu(tdbp, mtu);
+        tdb_unref(tdbp);
+    }
 }
 
 void
@@ -919,6 +1043,14 @@ udpencap_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 	union sockaddr_union *su_dst, *su_src;
 
 	NET_ASSERT_LOCKED();
+
+	// Ensure 'v' is not NULL and points to a valid IP header
+	if (!v || ((uintptr_t)v % __alignof__(struct ip)) != 0)
+		return;
+
+	// Ensure 'v' has enough space for an IP header
+	if (((struct ip *)v)->ip_hl < (sizeof(struct ip) >> 2))
+		return;
 
 	icp = (struct icmp *)((caddr_t) ip - offsetof(struct icmp, icmp_ip));
 	mtu = ntohs(icp->icmp_nextmtu);
@@ -949,7 +1081,9 @@ udpencap_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 		    ((tdbp->tdb_flags & (TDBF_INVALID|TDBF_UDPENCAP)) ==
 		    TDBF_UDPENCAP) &&
 		    !memcmp(&tdbp->tdb_dst, &dst, su_dst->sa.sa_len) &&
-		    !memcmp(&tdbp->tdb_src, &src, su_src->sa.sa_len))
+		    !memcmp(&tdbp->tdb_src, &src, su_src->sa.sa_len) &&
+		    su_dst->sa.sa_len <= sizeof(dst) && 
+		    su_src->sa.sa_len <= sizeof(src))
 			ipsec_set_mtu(tdbp, mtu);
 	}
 	mtx_leave(&tdb_sadb_mtx);
@@ -959,8 +1093,9 @@ udpencap_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 void
 esp4_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 {
-	if (sa->sa_family != AF_INET ||
-	    sa->sa_len != sizeof(struct sockaddr_in))
+	if (sa == NULL || sa->sa_family != AF_INET ||
+	    sa->sa_len != sizeof(struct sockaddr_in) ||
+	    cmd < 0 || rdomain >= UINT_MAX || rdomain < 0)
 		return;
 
 	ipsec_common_ctlinput(rdomain, cmd, sa, v, IPPROTO_ESP);
@@ -999,24 +1134,32 @@ ipsec_protoff(struct mbuf *m, int off, int af)
 	l = 0;
 
 	do {
+		if (protoff > INT_MAX - l)
+			return -1;
+		
 		protoff += l;
-		m_copydata(m, protoff, sizeof(ip6e),
-		    (caddr_t) &ip6e);
+		
+		if (protoff < 0 || protoff + (int)sizeof(ip6e) > m->m_len)
+			return -1;
+
+		m_copydata(m, protoff, sizeof(ip6e), (caddr_t) &ip6e);
 
 		if (nxt == IPPROTO_AH)
 			l = (ip6e.ip6e_len + 2) << 2;
 		else
 			l = (ip6e.ip6e_len + 1) << 3;
-#ifdef DIAGNOSTIC
+
 		if (l <= 0)
-			panic("%s: l went zero or negative", __func__);
-#endif
+			return -1;
 
 		nxt = ip6e.ip6e_nxt;
-	} while (protoff + l < off);
+	} while (protoff <= INT_MAX - l && protoff + l < off);
 
 	/* Malformed packet check */
 	if (protoff + l != off)
+		return -1;
+
+	if (protoff > INT_MAX - offsetof(struct ip6_ext, ip6e_nxt))
 		return -1;
 
 	protoff += offsetof(struct ip6_ext, ip6e_nxt);
@@ -1052,72 +1195,41 @@ ipsec_forward_check(struct mbuf *m, int hlen, int af)
 int
 ipsec_local_check(struct mbuf *m, int hlen, int proto, int af)
 {
-	struct tdb *tdb;
-	struct tdb_ident *tdbi;
-	struct m_tag *mtag;
-	int error = 0;
+    struct tdb *tdb;
+    struct tdb_ident *tdbi;
+    struct m_tag *mtag;
+    int error = 0;
 
-	/*
-	 * If it's a protected packet for us, skip the policy check.
-	 * That's because we really only care about the properties of
-	 * the protected packet, and not the intermediate versions.
-	 * While this is not the most paranoid setting, it allows
-	 * some flexibility in handling nested tunnels (in setting up
-	 * the policies).
-	 */
-	if ((proto == IPPROTO_ESP) || (proto == IPPROTO_AH) ||
-	    (proto == IPPROTO_IPCOMP))
-		return 0;
+    if (hlen < 0 || hlen > INT_MAX - sizeof(struct tdb_ident)) {
+        return -1;  // or some appropriate error code
+    }
 
-	/*
-	 * If the protected packet was tunneled, then we need to
-	 * verify the protected packet's information, not the
-	 * external headers. Thus, skip the policy lookup for the
-	 * external packet, and keep the IPsec information linked on
-	 * the packet header (the encapsulation routines know how
-	 * to deal with that).
-	 */
-	if ((proto == IPPROTO_IPV4) || (proto == IPPROTO_IPV6))
-		return 0;
+    if ((proto == IPPROTO_ESP) || (proto == IPPROTO_AH) ||
+        (proto == IPPROTO_IPCOMP))
+        return 0;
 
-	/*
-	 * When processing IPv6 header chains, do not look at the
-	 * outer header.  The inner protocol is relevant and will
-	 * be checked by the local delivery loop later.
-	 */
-	if ((af == AF_INET6) && ((proto == IPPROTO_DSTOPTS) ||
-	    (proto == IPPROTO_ROUTING) || (proto == IPPROTO_FRAGMENT)))
-		return 0;
+    if ((proto == IPPROTO_IPV4) || (proto == IPPROTO_IPV6))
+        return 0;
 
-	/*
-	 * If the protected packet is TCP or UDP, we'll do the
-	 * policy check in the respective input routine, so we can
-	 * check for bypass sockets.
-	 */
-	if ((proto == IPPROTO_TCP) || (proto == IPPROTO_UDP))
-		return 0;
+    if ((af == AF_INET6) && ((proto == IPPROTO_DSTOPTS) ||
+        (proto == IPPROTO_ROUTING) || (proto == IPPROTO_FRAGMENT)))
+        return 0;
 
-	/*
-	 * IPsec policy check for local-delivery packets. Look at the
-	 * inner-most SA that protected the packet. This is in fact
-	 * a bit too restrictive (it could end up causing packets to
-	 * be dropped that semantically follow the policy, e.g., in
-	 * certain SA-bundle configurations); but the alternative is
-	 * very complicated (and requires keeping track of what
-	 * kinds of tunneling headers have been seen in-between the
-	 * IPsec headers), and I don't think we lose much functionality
-	 * that's needed in the real world (who uses bundles anyway ?).
-	 */
-	mtag = m_tag_find(m, PACKET_TAG_IPSEC_IN_DONE, NULL);
-	if (mtag) {
-		tdbi = (struct tdb_ident *)(mtag + 1);
-		tdb = gettdb(tdbi->rdomain, tdbi->spi, &tdbi->dst,
-		    tdbi->proto);
-	} else
-		tdb = NULL;
-	error = ipsp_spd_lookup(m, af, hlen, IPSP_DIRECTION_IN,
-	    tdb, NULL, NULL, NULL);
-	tdb_unref(tdb);
+    if ((proto == IPPROTO_TCP) || (proto == IPPROTO_UDP))
+        return 0;
 
-	return error;
+    mtag = m_tag_find(m, PACKET_TAG_IPSEC_IN_DONE, NULL);
+    if (mtag) {
+        tdbi = (struct tdb_ident *)(mtag + 1);
+        if ((char *)tdbi + sizeof(struct tdb_ident) > (char *)mtag + mtag->m_tag_len) {
+            return -1;  // or some appropriate error code
+        }
+        tdb = gettdb(tdbi->rdomain, tdbi->spi, &tdbi->dst, tdbi->proto);
+    } else
+        tdb = NULL;
+    error = ipsp_spd_lookup(m, af, hlen, IPSP_DIRECTION_IN,
+        tdb, NULL, NULL, NULL);
+    tdb_unref(tdb);
+
+    return error;
 }

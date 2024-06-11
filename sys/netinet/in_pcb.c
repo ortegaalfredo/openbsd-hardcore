@@ -146,8 +146,21 @@ int	in_pcbpickport(u_int16_t *, const void *, int, const struct inpcb *,
 void
 in_init(void)
 {
-	pool_init(&inpcb_pool, sizeof(struct inpcb), 0,
-	    IPL_SOFTNET, 0, "inpcb", NULL);
+    // Ensure the size is within acceptable limits
+    if (sizeof(struct inpcb) > SIZE_MAX - sizeof(void*)) {
+        // Handle error appropriately (e.g., log, return, etc.)
+        return;
+    }
+
+    size_t pool_size = sizeof(struct inpcb);
+
+    // Ensure the pool_size does not cause integer overflow during calculations
+    if (pool_size > SIZE_MAX / 2) {
+        // Handle error appropriately (e.g., log, return, etc.)
+        return;
+    }
+
+    pool_init(&inpcb_pool, pool_size, 0, IPL_SOFTNET, 0, "inpcb", NULL);
 }
 
 uint64_t
@@ -157,6 +170,16 @@ in_pcbhash(struct inpcbtable *table, u_int rdomain,
 {
 	SIPHASH_CTX ctx;
 	u_int32_t nrdom = htonl(rdomain);
+
+	// Ensure that pointers are not NULL
+	if (table == NULL || faddr == NULL || laddr == NULL) {
+		return 0;
+	}
+
+	// Prevent integer overflow for rdomain, fport, and lport
+	if (rdomain > UINT_MAX || fport > USHRT_MAX || lport > USHRT_MAX) {
+		return 0;
+	}
 
 	SipHash24_Init(&ctx, &table->inpt_key);
 	SipHash24_Update(&ctx, &nrdom, sizeof(nrdom));
@@ -171,7 +194,14 @@ uint64_t
 in_pcblhash(struct inpcbtable *table, u_int rdomain, u_short lport)
 {
 	SIPHASH_CTX ctx;
-	u_int32_t nrdom = htonl(rdomain);
+	u_int32_t nrdom;
+
+	if (table == NULL) {
+		// Handle error appropriately
+		return 0;
+	}
+
+	nrdom = htonl(rdomain);
 
 	SipHash24_Init(&ctx, &table->inpt_lkey);
 	SipHash24_Update(&ctx, &nrdom, sizeof(nrdom));
@@ -182,6 +212,10 @@ in_pcblhash(struct inpcbtable *table, u_int rdomain, u_short lport)
 void
 in_pcbinit(struct inpcbtable *table, int hashsize)
 {
+	if (table == NULL || hashsize <= 0 || hashsize > INT_MAX) {
+		return;
+	}
+
 	mtx_init(&table->inpt_mtx, IPL_SOFTNET);
 	rw_init(&table->inpt_notify, "inpnotify");
 	TAILQ_INIT(&table->inpt_queue);
@@ -219,6 +253,8 @@ in_baddynamic(u_int16_t port, u_int16_t proto)
 int
 in_rootonly(u_int16_t port, u_int16_t proto)
 {
+	if (proto > 0xffff)
+		return (0);
 	switch (proto) {
 	case IPPROTO_TCP:
 		return (port < IPPORT_RESERVED ||
@@ -236,10 +272,13 @@ in_pcballoc(struct socket *so, struct inpcbtable *table, int wait)
 {
 	struct inpcb *inp;
 
-	inp = pool_get(&inpcb_pool, (wait == M_WAIT ? PR_WAITOK : PR_NOWAIT) |
-	    PR_ZERO);
+	if (table == NULL || so == NULL || so->so_proto == NULL || so->so_proto->pr_domain == NULL)
+		return (EINVAL);
+
+	inp = pool_get(&inpcb_pool, (wait == M_WAIT ? PR_WAITOK : PR_NOWAIT) | PR_ZERO);
 	if (inp == NULL)
 		return (ENOBUFS);
+
 	inp->inp_table = table;
 	inp->inp_socket = so;
 	refcnt_init_trace(&inp->inp_refcnt, DT_REFCNT_IDX_INPCB);
@@ -250,6 +289,7 @@ in_pcballoc(struct socket *so, struct inpcbtable *table, int wait)
 	inp->inp_seclevel[SL_IPCOMP] = IPSEC_IPCOMP_LEVEL_DEFAULT;
 	inp->inp_rtableid = curproc->p_p->ps_rtableid;
 	inp->inp_hops = -1;
+
 #ifdef INET6
 	switch (so->so_proto->pr_domain->dom_family) {
 	case PF_INET6:
@@ -265,6 +305,12 @@ in_pcballoc(struct socket *so, struct inpcbtable *table, int wait)
 #endif /* INET6 */
 
 	mtx_enter(&table->inpt_mtx);
+	if (table->inpt_count >= INT_MAX)
+	{
+		mtx_leave(&table->inpt_mtx);
+		pool_put(&inpcb_pool, inp);
+		return (EOVERFLOW);
+	}
 	if (table->inpt_count++ > INPCBHASH_LOADFACTOR(table->inpt_size))
 		(void)in_pcbresize(table, table->inpt_size * 2);
 	TAILQ_INSERT_HEAD(&table->inpt_queue, inp, inp_queue);
@@ -337,6 +383,11 @@ in_pcbbind_locked(struct inpcb *inp, struct mbuf *nam, struct proc *p)
 		    suser(p) != 0)
 			return (EACCES);
 	}
+
+	// Check for integer overflows
+	if (lport > 65535)
+		return (EINVAL);
+
 	if (nam) {
 #ifdef INET6
 		if (ISSET(inp->inp_flags, INP_IPV6))
@@ -345,6 +396,7 @@ in_pcbbind_locked(struct inpcb *inp, struct mbuf *nam, struct proc *p)
 #endif
 			inp->inp_laddr = *(struct in_addr *)laddr;
 	}
+
 	inp->inp_lport = lport;
 	in_pcbrehash(inp);
 
@@ -357,7 +409,10 @@ in_pcbbind(struct inpcb *inp, struct mbuf *nam, struct proc *p)
 	struct inpcbtable *table = inp->inp_table;
 	int error;
 
-	/* keep lookup, modification, and rehash in sync */
+	if (inp == NULL || nam == NULL || p == NULL || table == NULL) {
+		return -1; /* or appropriate error code */
+	}
+
 	mtx_enter(&table->inpt_mtx);
 	error = in_pcbbind_locked(inp, nam, p);
 	mtx_leave(&table->inpt_mtx);
@@ -369,35 +424,31 @@ int
 in_pcbaddrisavail_lock(const struct inpcb *inp, struct sockaddr_in *sin,
     int wild, struct proc *p, int lock)
 {
+	if (inp == NULL || sin == NULL || p == NULL) {
+		return (EINVAL); // Return error if any input pointer is NULL
+	}
+
 	struct socket *so = inp->inp_socket;
 	struct inpcbtable *table = inp->inp_table;
 	u_int16_t lport = sin->sin_port;
+
+	// Check for integer overflow
+	if (lport > UINT16_MAX) {
+		return (EINVAL); // Port should not exceed UINT16_MAX
+	}
+
 	int reuseport = (so->so_options & SO_REUSEPORT);
 
 	if (IN_MULTICAST(sin->sin_addr.s_addr)) {
-		/*
-		 * Treat SO_REUSEADDR as SO_REUSEPORT for multicast;
-		 * allow complete duplication of binding if
-		 * SO_REUSEPORT is set, or if SO_REUSEADDR is set
-		 * and a multicast address is bound on both
-		 * new and duplicated sockets.
-		 */
 		if (so->so_options & (SO_REUSEADDR|SO_REUSEPORT))
 			reuseport = SO_REUSEADDR|SO_REUSEPORT;
 	} else if (sin->sin_addr.s_addr != INADDR_ANY) {
-		/*
-		 * we must check that we are binding to an address we
-		 * own except when:
-		 * - SO_BINDANY is set or
-		 * - we are binding a UDP socket to 255.255.255.255 or
-		 * - we are binding a UDP socket to one of our broadcast
-		 *   addresses
-		 */
 		if (!ISSET(so->so_options, SO_BINDANY) &&
 		    !(so->so_type == SOCK_DGRAM &&
 		    sin->sin_addr.s_addr == INADDR_BROADCAST) &&
 		    !(so->so_type == SOCK_DGRAM &&
 		    in_broadcast(sin->sin_addr, inp->inp_rtableid))) {
+			
 			struct ifaddr *ia;
 
 			sin->sin_port = 0;
@@ -440,7 +491,15 @@ int
 in_pcbaddrisavail(const struct inpcb *inp, struct sockaddr_in *sin,
     int wild, struct proc *p)
 {
-	return in_pcbaddrisavail_lock(inp, sin, wild, p, IN_PCBLOCK_GRAB);
+    if (!inp || !sin || !p) {
+        return 0; // or appropriate error value
+    }
+    if ((unsigned long)inp > UINTPTR_MAX - sizeof(struct inpcb) ||
+        (unsigned long)sin > UINTPTR_MAX - sizeof(struct sockaddr_in) ||
+        (unsigned long)p > UINTPTR_MAX - sizeof(struct proc)) {
+        return 0; // or appropriate error value
+    }
+    return in_pcbaddrisavail_lock(inp, sin, wild, p, IN_PCBLOCK_GRAB);
 }
 
 int
@@ -451,7 +510,7 @@ in_pcbpickport(u_int16_t *lport, const void *laddr, int wild,
 	struct inpcbtable *table = inp->inp_table;
 	struct inpcb *t;
 	u_int16_t first, last, lower, higher, candidate, localport;
-	int count;
+	unsigned int count;
 
 	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 
@@ -461,12 +520,23 @@ in_pcbpickport(u_int16_t *lport, const void *laddr, int wild,
 	} else if (inp->inp_flags & INP_LOWPORT) {
 		if (suser(p))
 			return (EACCES);
+		if (IPPORT_RESERVED < 1 || IPPORT_RESERVED > INT_MAX) // Check for integer overflow
+			return (EINVAL);
+		if (600 > IPPORT_RESERVED-1) // Check for invalid range
+			return (EINVAL);
 		first = IPPORT_RESERVED-1; /* 1023 */
 		last = 600;		   /* not IPPORT_RESERVED/2 */
 	} else {
 		first = ipport_firstauto;	/* sysctl */
 		last = ipport_lastauto;
 	}
+
+	/* Ensure 'first' and 'last' are within valid port range */
+	if (first > 65535)
+		first = 65535;
+	if (last > 65535)
+		last = 65535;
+
 	if (first < last) {
 		lower = first;
 		higher = last;
@@ -475,17 +545,25 @@ in_pcbpickport(u_int16_t *lport, const void *laddr, int wild,
 		higher = first;
 	}
 
-	/*
-	 * Simple check to ensure all ports are not used up causing
-	 * a deadlock here.
-	 */
+	/* Ensure the range is within valid port limits */
+	if (lower > 65535)
+		lower = 65535;
+	if (higher > 65535)
+		higher = 65535;
+
+	/* Ensure 'count' does not overflow */
+	if (higher < lower)
+		return (EADDRNOTAVAIL);
 
 	count = higher - lower;
+	if (count == 0)
+		return (EADDRNOTAVAIL);
+
 	candidate = lower + arc4random_uniform(count);
 
 	do {
 		do {
-			if (count-- < 0)	/* completely used? */
+			if (count-- == 0)	/* completely used? */
 				return (EADDRNOTAVAIL);
 			++candidate;
 			if (candidate < lower || candidate > higher)
@@ -522,8 +600,13 @@ in_pcbconnect(struct inpcb *inp, struct mbuf *nam)
 
 	if ((error = in_nam2sin(nam, &sin)))
 		return (error);
+
+	if ((sin == NULL) || (nam == NULL) || (inp == NULL) || (table == NULL)) 
+		return (EINVAL);
+
 	if (sin->sin_port == 0)
 		return (EADDRNOTAVAIL);
+
 	error = in_pcbselsrc(&ina, sin, inp);
 	if (error)
 		return (error);
@@ -574,20 +657,33 @@ in_pcbconnect(struct inpcb *inp, struct mbuf *nam)
 void
 in_pcbdisconnect(struct inpcb *inp)
 {
+    if (inp == NULL || inp->inp_socket == NULL) {
+        return;
+    }
+
 #if NPF > 0
-	pf_remove_divert_state(inp);
-	pf_inp_unlink(inp);
+    pf_remove_divert_state(inp);
+    pf_inp_unlink(inp);
 #endif
-	inp->inp_flowid = 0;
-	if (inp->inp_socket->so_state & SS_NOFDREF)
-		in_pcbdetach(inp);
+
+    inp->inp_flowid = 0;
+    
+    if (inp->inp_socket->so_state & SS_NOFDREF) {
+        in_pcbdetach(inp);
+    }
 }
 
 void
 in_pcbdetach(struct inpcb *inp)
 {
-	struct socket *so = inp->inp_socket;
-	struct inpcbtable *table = inp->inp_table;
+	struct socket *so;
+	struct inpcbtable *table;
+
+	if (inp == NULL || inp->inp_socket == NULL || inp->inp_table == NULL)
+		return;
+
+	so = inp->inp_socket;
+	table = inp->inp_table;
 
 	so->so_pcb = NULL;
 	/*
@@ -617,7 +713,10 @@ in_pcbdetach(struct inpcb *inp)
 	LIST_REMOVE(inp, inp_lhash);
 	LIST_REMOVE(inp, inp_hash);
 	TAILQ_REMOVE(&table->inpt_queue, inp, inp_queue);
-	table->inpt_count--;
+
+	if (table->inpt_count > 0 && table->inpt_count <= UINT_MAX)
+		table->inpt_count--;
+
 	mtx_leave(&table->inpt_mtx);
 
 	in_pcbunref(inp);
@@ -660,8 +759,23 @@ in_setsockaddr(struct inpcb *inp, struct mbuf *nam)
 	}
 #endif
 
+	/* Check if nam is large enough to hold sockaddr_in */
+	if (nam == NULL || nam->m_len < sizeof(*sin)) {
+		return; /* Handle error appropriately in your real code */
+	}
+
+	/* Check for potential integer overflow */
+	if (sizeof(*sin) > nam->m_len) {
+		return; /* Handle error appropriately in your real code */
+	}
+
 	nam->m_len = sizeof(*sin);
 	sin = mtod(nam, struct sockaddr_in *);
+
+	if (sin == NULL) {
+		return; /* Handle error appropriately in your real code */
+	}
+
 	memset(sin, 0, sizeof(*sin));
 	sin->sin_family = AF_INET;
 	sin->sin_len = sizeof(*sin);
@@ -681,8 +795,15 @@ in_setpeeraddr(struct inpcb *inp, struct mbuf *nam)
 	}
 #endif
 
+	if (nam == NULL || nam->m_len < sizeof(*sin)) {
+		return; // Avoid null pointer dereference and ensure sufficient memory length
+	}
+
 	nam->m_len = sizeof(*sin);
 	sin = mtod(nam, struct sockaddr_in *);
+	if (sin == NULL) {
+		return; // Avoid null pointer dereference
+	}
 	memset(sin, 0, sizeof(*sin));
 	sin->sin_family = AF_INET;
 	sin->sin_len = sizeof(*sin);
@@ -695,7 +816,15 @@ in_sockaddr(struct socket *so, struct mbuf *nam)
 {
 	struct inpcb *inp;
 
+	if (!so || !nam) {
+		return (-1); // Error handling for null pointers
+	}
+
 	inp = sotoinpcb(so);
+	if (!inp) {
+		return (-1); // Error handling for null pointer returned by sotoinpcb
+	}
+	
 	in_setsockaddr(inp, nam);
 
 	return (0);
@@ -704,12 +833,19 @@ in_sockaddr(struct socket *so, struct mbuf *nam)
 int
 in_peeraddr(struct socket *so, struct mbuf *nam)
 {
-	struct inpcb *inp;
+    struct inpcb *inp;
+    if (so == NULL || nam == NULL) {
+        return -1;
+    }
 
-	inp = sotoinpcb(so);
-	in_setpeeraddr(inp, nam);
+    inp = sotoinpcb(so);
+    if (inp == NULL) {
+        return -1;
+    }
 
-	return (0);
+    in_setpeeraddr(inp, nam);
+
+    return (0);
 }
 
 /*
@@ -813,7 +949,7 @@ in_losing(struct inpcb *inp)
 void
 in_rtchange(struct inpcb *inp, int errno)
 {
-	if (inp->inp_route.ro_rt) {
+	if (inp && inp->inp_route.ro_rt) {
 		rtfree(inp->inp_route.ro_rt);
 		inp->inp_route.ro_rt = NULL;
 		/*
@@ -921,8 +1057,14 @@ in_pcbrtentry(struct inpcb *inp)
 		return (NULL);
 	if (route_cache(ro, &inp->inp_faddr, &inp->inp_laddr,
 	    inp->inp_rtableid)) {
-		ro->ro_rt = rtalloc_mpath(&ro->ro_dstsa,
-		    &inp->inp_laddr.s_addr, ro->ro_tableid);
+		if (ro->ro_dstsa.sa_len <= sizeof(struct sockaddr) && 
+		    inp->inp_laddr.s_addr <= UINT32_MAX && 
+		    inp->inp_laddr.s_addr >= 0) {
+			ro->ro_rt = rtalloc_mpath(&ro->ro_dstsa,
+			    &inp->inp_laddr.s_addr, ro->ro_tableid);
+		} else {
+			return (NULL);
+		}
 	}
 	return (ro->ro_rt);
 }
@@ -1024,6 +1166,10 @@ in_pcbselsrc(struct in_addr *insrc, struct sockaddr_in *sin,
 void
 in_pcbrehash(struct inpcb *inp)
 {
+	if (inp == NULL || inp->inp_lhash.le_prev == NULL || inp->inp_hash.le_prev == NULL) {
+		return;
+	}
+
 	LIST_REMOVE(inp, inp_lhash);
 	LIST_REMOVE(inp, inp_hash);
 	in_pcbhash_insert(inp);
@@ -1065,6 +1211,17 @@ in_pcbhash_lookup(struct inpcbtable *table, uint64_t hash, u_int rdomain,
 
 	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 
+    // Check for null pointers and valid range
+	if (table == NULL || table->inpt_hashtbl == NULL || faddr == NULL || laddr == NULL ||
+	    hash > UINT64_MAX || rdomain > UINT_MAX || fport > USHRT_MAX || lport > USHRT_MAX) {
+		return NULL;
+	}
+
+    // Check for hash mask validity
+	if ((hash & table->inpt_mask) >= table->inpt_size) { // Ensure valid index
+		return NULL;
+	}
+
 	head = &table->inpt_hashtbl[hash & table->inpt_mask];
 	LIST_FOREACH(inp, head, inp_hash) {
 #ifdef INET6
@@ -1095,40 +1252,56 @@ in_pcbhash_lookup(struct inpcbtable *table, uint64_t hash, u_int rdomain,
 int
 in_pcbresize(struct inpcbtable *table, int hashsize)
 {
-	u_long nmask, nlmask;
-	int osize;
-	void *nhashtbl, *nlhashtbl, *ohashtbl, *olhashtbl;
-	struct inpcb *inp;
+    u_long nmask, nlmask;
+    int osize;
+    void *nhashtbl, *nlhashtbl, *ohashtbl, *olhashtbl;
+    struct inpcb *inp;
 
-	MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
+    // Check for integer overflows
+    if (hashsize <= 0 || hashsize > INT_MAX / sizeof(struct inpcb)) {
+        return EINVAL;
+    }
 
-	ohashtbl = table->inpt_hashtbl;
-	olhashtbl = table->inpt_lhashtbl;
-	osize = table->inpt_size;
+    MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 
-	nhashtbl = hashinit(hashsize, M_PCB, M_NOWAIT, &nmask);
-	if (nhashtbl == NULL)
-		return ENOBUFS;
-	nlhashtbl = hashinit(hashsize, M_PCB, M_NOWAIT, &nlmask);
-	if (nlhashtbl == NULL) {
-		hashfree(nhashtbl, hashsize, M_PCB);
-		return ENOBUFS;
-	}
-	table->inpt_hashtbl = nhashtbl;
-	table->inpt_lhashtbl = nlhashtbl;
-	table->inpt_mask = nmask;
-	table->inpt_lmask = nlmask;
-	table->inpt_size = hashsize;
+    ohashtbl = table->inpt_hashtbl;
+    olhashtbl = table->inpt_lhashtbl;
+    osize = table->inpt_size;
 
-	TAILQ_FOREACH(inp, &table->inpt_queue, inp_queue) {
-		LIST_REMOVE(inp, inp_lhash);
-		LIST_REMOVE(inp, inp_hash);
-		in_pcbhash_insert(inp);
-	}
-	hashfree(ohashtbl, osize, M_PCB);
-	hashfree(olhashtbl, osize, M_PCB);
+    nhashtbl = hashinit(hashsize, M_PCB, M_NOWAIT, &nmask);
+    if (nhashtbl == NULL)
+        return ENOBUFS;
+    nlhashtbl = hashinit(hashsize, M_PCB, M_NOWAIT, &nlmask);
+    if (nlhashtbl == NULL) {
+        hashfree(nhashtbl, hashsize, M_PCB);
+        return ENOBUFS;
+    }
+    table->inpt_hashtbl = nhashtbl;
+    table->inpt_lhashtbl = nlhashtbl;
+    table->inpt_mask = nmask;
+    table->inpt_lmask = nlmask;
+    table->inpt_size = hashsize;
 
-	return (0);
+    TAILQ_FOREACH(inp, &table->inpt_queue, inp_queue) {
+        // Check for possible invalid memory access
+        if ((char *)inp < (char *)ohashtbl || (char *)inp >= (char *)ohashtbl + osize * sizeof(struct inpcb)) {
+            hashfree(nhashtbl, hashsize, M_PCB);
+            hashfree(nlhashtbl, hashsize, M_PCB);
+            table->inpt_hashtbl = ohashtbl;
+            table->inpt_lhashtbl = olhashtbl;
+            table->inpt_mask = nmask;
+            table->inpt_lmask = nlmask;
+            table->inpt_size = osize;
+            return EFAULT;
+        }
+        LIST_REMOVE(inp, inp_lhash);
+        LIST_REMOVE(inp, inp_hash);
+        in_pcbhash_insert(inp);
+    }
+    hashfree(ohashtbl, osize, M_PCB);
+    hashfree(olhashtbl, osize, M_PCB);
+
+    return (0);
 }
 
 #ifdef DIAGNOSTIC
@@ -1152,7 +1325,17 @@ in_pcblookup_lock(struct inpcbtable *table, struct in_addr faddr,
 	uint64_t hash;
 	u_int rdomain;
 
+	/* Validate the input parameters to prevent out-of-bounds and integer overflow */
+	if (table == NULL || fport > UINT_MAX || lport > UINT_MAX || rtable > UINT_MAX) {
+		return NULL;
+	}
+
 	rdomain = rtable_l2(rtable);
+
+	if (rdomain > UINT_MAX) {  // Ensure rdomain is within valid range
+		return NULL;
+	}
+
 	hash = in_pcbhash(table, rdomain, &faddr, fport, &laddr, lport);
 
 	if (lock == IN_PCBLOCK_GRAB) {
@@ -1161,8 +1344,10 @@ in_pcblookup_lock(struct inpcbtable *table, struct in_addr faddr,
 		KASSERT(lock == IN_PCBLOCK_HOLD);
 		MUTEX_ASSERT_LOCKED(&table->inpt_mtx);
 	}
+
 	inp = in_pcbhash_lookup(table, hash, rdomain,
 	    &faddr, fport, &laddr, lport);
+
 	if (lock == IN_PCBLOCK_GRAB) {
 		in_pcbref(inp);
 		mtx_leave(&table->inpt_mtx);
@@ -1182,8 +1367,11 @@ struct inpcb *
 in_pcblookup(struct inpcbtable *table, struct in_addr faddr,
     u_int fport, struct in_addr laddr, u_int lport, u_int rtable)
 {
-	return in_pcblookup_lock(table, faddr, fport, laddr, lport, rtable,
-	    IN_PCBLOCK_GRAB);
+    if (table == NULL || fport > UINT_MAX || lport > UINT_MAX || rtable > UINT_MAX)
+        return NULL;
+
+    return in_pcblookup_lock(table, faddr, fport, laddr, lport, rtable,
+        IN_PCBLOCK_GRAB);
 }
 
 /*
@@ -1202,9 +1390,15 @@ in_pcblookup_listen(struct inpcbtable *table, struct in_addr laddr,
 	uint64_t hash;
 	u_int16_t lport = lport_arg;
 	u_int rdomain;
+    
+    // Check for integer overflow in lport_arg to u_int16_t conversion
+	if (lport_arg > UINT16_MAX) {
+		return NULL;
+	}
 
 	key1 = &laddr;
 	key2 = &zeroin_addr;
+
 #if NPF > 0
 	if (m && m->m_pkthdr.pf.flags & PF_TAG_DIVERTED) {
 		struct pf_divert *divert;
@@ -1215,6 +1409,10 @@ in_pcblookup_listen(struct inpcbtable *table, struct in_addr laddr,
 		case PF_DIVERT_TO:
 			key1 = key2 = &divert->addr.v4;
 			lport = divert->port;
+			// Check for integer overflow in divert->port to u_int16_t conversion
+			if (divert->port > UINT16_MAX) {
+				return NULL;
+			}
 			break;
 		case PF_DIVERT_REPLY:
 			return (NULL);
@@ -1269,6 +1467,13 @@ in_pcbset_rtableid(struct inpcb *inp, u_int rtableid)
 	if (!rtable_exists(rtableid))
 		return (EINVAL);
 
+	/* Check for overflow in inp->inp_rtableid */
+	if (rtableid > UINT_MAX)
+		return (EINVAL);
+
+	if (table == NULL)
+		return (EINVAL);
+
 	mtx_enter(&table->inpt_mtx);
 	if (inp->inp_lport) {
 		mtx_leave(&table->inpt_mtx);
@@ -1286,14 +1491,34 @@ in_pcbset_laddr(struct inpcb *inp, const struct sockaddr *sa, u_int rtableid)
 {
 	struct inpcbtable *table = inp->inp_table;
 
+	if (inp == NULL || sa == NULL) {
+		return; // Early return on invalid input
+	}
+
 	mtx_enter(&table->inpt_mtx);
+
+	if (rtableid > UINT_MAX) {
+		mtx_leave(&table->inpt_mtx);
+		return; // Early return on invalid rtableid
+	}
 	inp->inp_rtableid = rtableid;
+
 #ifdef INET6
 	if (ISSET(inp->inp_flags, INP_IPV6)) {
 		const struct sockaddr_in6 *sin6;
 
 		KASSERT(sa->sa_family == AF_INET6);
+		if (sa->sa_family != AF_INET6) {
+			mtx_leave(&table->inpt_mtx);
+			return; // Early return on invalid address family
+		}
 		sin6 = satosin6_const(sa);
+
+		if (sin6 == NULL) {
+			mtx_leave(&table->inpt_mtx);
+			return; // Early return on null address
+		}
+
 		inp->inp_lport = sin6->sin6_port;
 		inp->inp_laddr6 = sin6->sin6_addr;
 	} else
@@ -1302,7 +1527,17 @@ in_pcbset_laddr(struct inpcb *inp, const struct sockaddr *sa, u_int rtableid)
 		const struct sockaddr_in *sin;
 
 		KASSERT(sa->sa_family == AF_INET);
+		if (sa->sa_family != AF_INET) {
+			mtx_leave(&table->inpt_mtx);
+			return; // Early return on invalid address family
+		}
 		sin = satosin_const(sa);
+
+		if (sin == NULL) {
+			mtx_leave(&table->inpt_mtx);
+			return; // Early return on null address
+		}
+
 		inp->inp_lport = sin->sin_port;
 		inp->inp_laddr = sin->sin_addr;
 	}
@@ -1313,6 +1548,9 @@ in_pcbset_laddr(struct inpcb *inp, const struct sockaddr *sa, u_int rtableid)
 void
 in_pcbunset_faddr(struct inpcb *inp)
 {
+	if (inp == NULL || inp->inp_table == NULL)
+		return;
+
 	struct inpcbtable *table = inp->inp_table;
 
 	mtx_enter(&table->inpt_mtx);
@@ -1330,7 +1568,10 @@ in_pcbunset_faddr(struct inpcb *inp)
 void
 in_pcbunset_laddr(struct inpcb *inp)
 {
-	struct inpcbtable *table = inp->inp_table;
+	struct inpcbtable *table;
+	if (inp == NULL || (table = inp->inp_table) == NULL) {
+		return;
+	}
 
 	mtx_enter(&table->inpt_mtx);
 #ifdef INET6

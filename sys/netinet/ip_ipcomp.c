@@ -73,6 +73,11 @@
 int
 ipcomp_attach(void)
 {
+	if (sizeof(int) < 4) {
+		/* Ensure the size of int is at least 4 bytes to avoid overflow issues */
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -86,17 +91,24 @@ ipcomp_init(struct tdb *tdbp, const struct xformsw *xsp, struct ipsecinit *ii)
 	struct cryptoini cric;
 	int error;
 
+	if (tdbp == NULL || xsp == NULL || ii == NULL) {
+		return EINVAL;
+	}
+
 	switch (ii->ii_compalg) {
 	case SADB_X_CALG_DEFLATE:
 		tcomp = &comp_algo_deflate;
 		break;
 	default:
-		DPRINTF("unsupported compression algorithm %d specified",
-		    ii->ii_compalg);
+		DPRINTF("unsupported compression algorithm %d specified", ii->ii_compalg);
 		return EINVAL;
 	}
 
 	tdbp->tdb_compalgxform = tcomp;
+
+	if (tcomp == NULL || tcomp->name == NULL) {
+		return EINVAL;
+	}
 
 	DPRINTF("initialized TDB with ipcomp algorithm %s", tcomp->name);
 
@@ -106,9 +118,14 @@ ipcomp_init(struct tdb *tdbp, const struct xformsw *xsp, struct ipsecinit *ii)
 	memset(&cric, 0, sizeof(cric));
 	cric.cri_alg = tdbp->tdb_compalgxform->type;
 
+	if (cric.cri_alg <= 0) {
+		return EINVAL;
+	}
+
 	KERNEL_LOCK();
 	error = crypto_newsession(&tdbp->tdb_cryptoid, &cric, 0);
 	KERNEL_UNLOCK();
+
 	return error;
 }
 
@@ -120,9 +137,18 @@ ipcomp_zeroize(struct tdb *tdbp)
 {
 	int error;
 
+	if (tdbp == NULL) {
+		return -1; // or any appropriate error code
+	}
+
+	if (tdbp->tdb_cryptoid < 0) {
+		return -1; // or any appropriate error code
+	}
+
 	KERNEL_LOCK();
 	error = crypto_freesession(tdbp->tdb_cryptoid);
 	KERNEL_UNLOCK();
+
 	tdbp->tdb_cryptoid = 0;
 	return error;
 }

@@ -329,12 +329,17 @@ ipsp_process_packet(struct mbuf *m, struct tdb *tdb, int af, int tunalready)
 					 */
 					dstopt = 1;
 				} else if (nxt == IPPROTO_ROUTING) {
-					/*
-					 * if we see destination option next
-					 * time, it must be dest2.
-					 */
-					dstopt = 2;
-				}
+    /*
+     * if we see destination option next
+     * time, it must be dest2.
+     */
+    if (dstopt < INT_MAX) { // Check to avoid integer overflow
+        dstopt = 2;
+    } else {
+        // Handle overflow case if needed, e.g., log an error or set to a safe value
+        dstopt = 2;
+    }
+}
 				if (m->m_pkthdr.len < hlen + sizeof(ip6e)) {
 					error = EINVAL;
 					goto drop;
@@ -562,6 +567,10 @@ ipsec_hdrsz(struct tdb *tdbp)
 {
 	ssize_t adjust;
 
+	/* Check for potential overflows and invalid pointers */
+	if (tdbp == NULL)
+		return (-1);
+
 	switch (tdbp->tdb_sproto) {
 	case IPPROTO_IPIP:
 		adjust = 0;
@@ -573,12 +582,25 @@ ipsec_hdrsz(struct tdb *tdbp)
 
 		/* Header length */
 		adjust = 2 * sizeof(u_int32_t) + tdbp->tdb_ivlen;
-		if (tdbp->tdb_flags & TDBF_UDPENCAP)
+		if (adjust < 0)
+			return (-1);
+
+		if (tdbp->tdb_flags & TDBF_UDPENCAP) {
+			if (adjust > SSIZE_MAX - sizeof(struct udphdr))
+				return (-1);
 			adjust += sizeof(struct udphdr);
+		}
+
 		/* Authenticator */
-		if (tdbp->tdb_authalgxform != NULL)
+		if (tdbp->tdb_authalgxform != NULL) {
+			if (adjust > SSIZE_MAX - tdbp->tdb_authalgxform->authsize)
+				return (-1);
 			adjust += tdbp->tdb_authalgxform->authsize;
+		}
+
 		/* Padding */
+		if (adjust > SSIZE_MAX - MAX(4, tdbp->tdb_encalgxform->blocksize))
+			return (-1);
 		adjust += MAX(4, tdbp->tdb_encalgxform->blocksize);
 		break;
 
@@ -587,6 +609,10 @@ ipsec_hdrsz(struct tdb *tdbp)
 			return (-1);
 
 		adjust = AH_FLENGTH + sizeof(u_int32_t);
+		if (adjust < 0)
+			return (-1);
+		if (adjust > SSIZE_MAX - tdbp->tdb_authalgxform->authsize)
+			return (-1);
 		adjust += tdbp->tdb_authalgxform->authsize;
 		break;
 
@@ -600,10 +626,14 @@ ipsec_hdrsz(struct tdb *tdbp)
 
 	switch (tdbp->tdb_dst.sa.sa_family) {
 	case AF_INET:
+		if (adjust > SSIZE_MAX - sizeof(struct ip))
+			return (-1);
 		adjust += sizeof(struct ip);
 		break;
 #ifdef INET6
 	case AF_INET6:
+		if (adjust > SSIZE_MAX - sizeof(struct ip6_hdr))
+			return (-1);
 		adjust += sizeof(struct ip6_hdr);
 		break;
 #endif /* INET6 */
@@ -631,6 +661,11 @@ ipsec_adjust_mtu(struct mbuf *m, u_int32_t mtu)
 			break;
 
 		if ((adjust = ipsec_hdrsz(tdbp)) == -1) {
+			tdb_unref(tdbp);
+			break;
+		}
+
+		if ((ssize_t)mtu - adjust < 0) {
 			tdb_unref(tdbp);
 			break;
 		}

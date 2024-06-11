@@ -128,16 +128,27 @@ arptimer(void *arg)
 	struct llinfo_arp *la, *nla;
 	time_t uptime;
 
+	if (to == NULL) return;  // Check for null pointer
+
 	NET_LOCK();
+
 	uptime = getuptime();
+	if (uptime < 0) {  // Check for valid uptime
+		NET_UNLOCK();
+		return;
+	}
+
 	timeout_add_sec(to, arpt_prune);
 	/* Net lock is exclusive, no arp mutex needed for arp_list here. */
 	LIST_FOREACH_SAFE(la, &arp_list, la_list, nla) {
 		struct rtentry *rt = la->la_rt;
 
+		if (rt == NULL) continue;  // Check for null pointer
+
 		if (rt->rt_expire && rt->rt_expire < uptime)
 			arptfree(rt); /* timer has expired; clear */
 	}
+
 	NET_UNLOCK();
 }
 
@@ -146,8 +157,28 @@ arpinit(void)
 {
 	static struct timeout arptimer_to;
 
+	if (sizeof(struct llinfo_arp) <= 0 || sizeof(struct llinfo_arp) > UINT_MAX) {
+	    return;
+	}
+
 	pool_init(&arp_pool, sizeof(struct llinfo_arp), 0,
 	    IPL_SOFTNET, 0, "arp", NULL);
+
+	if ((uintptr_t)&arptimer_to + sizeof(arptimer_to) <= (uintptr_t)&arptimer_to) {
+	    return;
+	}
+
+	if (arpt_prune <= 0 || arpt_prune > INT_MAX) {
+	    return;
+	}
+
+	if ((uintptr_t)&arptimer_to + (uintptr_t)arpt_prune < (uintptr_t)&arptimer_to) {
+	    return;
+	}
+
+	if ((uintptr_t)&arptimer_to + (uintptr_t)arpt_prune <= (uintptr_t)&arptimer_to) { 
+	    return;
+	}
 
 	timeout_set_flags(&arptimer_to, arptimer, &arptimer_to,
 	    KCLOCK_NONE, TIMEOUT_PROC | TIMEOUT_MPSAFE);
@@ -157,94 +188,100 @@ arpinit(void)
 void
 arp_rtrequest(struct ifnet *ifp, int req, struct rtentry *rt)
 {
-	struct sockaddr *gate = rt->rt_gateway;
-	struct llinfo_arp *la;
-	time_t uptime;
+    struct sockaddr *gate = rt->rt_gateway;
+    struct llinfo_arp *la;
+    time_t uptime;
 
-	NET_ASSERT_LOCKED();
+    NET_ASSERT_LOCKED();
 
-	if (ISSET(rt->rt_flags,
-	    RTF_GATEWAY|RTF_BROADCAST|RTF_MULTICAST|RTF_MPLS))
-		return;
+    if (rt == NULL || gate == NULL) // Check for NULL pointers
+        return;
 
-	uptime = getuptime();
-	switch (req) {
-	case RTM_ADD:
-		if (rt->rt_flags & RTF_CLONING) {
-			rt->rt_expire = 0;
-			break;
-		}
-		if ((rt->rt_flags & RTF_LOCAL) && rt->rt_llinfo == NULL)
-			rt->rt_expire = 0;
-		/*
-		 * Announce a new entry if requested or warn the user
-		 * if another station has this IP address.
-		 */
-		if (rt->rt_flags & (RTF_ANNOUNCE|RTF_LOCAL))
-			arprequest(ifp,
-			    &satosin(rt_key(rt))->sin_addr.s_addr,
-			    &satosin(rt_key(rt))->sin_addr.s_addr,
-			    (u_char *)LLADDR(satosdl(gate)));
-		/*FALLTHROUGH*/
-	case RTM_RESOLVE:
-		if (gate->sa_family != AF_LINK ||
-		    gate->sa_len < sizeof(struct sockaddr_dl)) {
-			log(LOG_DEBUG, "%s: bad gateway value: %s\n", __func__,
-			    ifp->if_xname);
-			break;
-		}
-		satosdl(gate)->sdl_type = ifp->if_type;
-		satosdl(gate)->sdl_index = ifp->if_index;
-		/*
-		 * Case 2:  This route may come from cloning, or a manual route
-		 * add with a LL address.
-		 */
-		la = pool_get(&arp_pool, PR_NOWAIT | PR_ZERO);
-		if (la == NULL) {
-			log(LOG_DEBUG, "%s: pool get failed\n", __func__);
-			break;
-		}
+    if (ISSET(rt->rt_flags,
+        RTF_GATEWAY|RTF_BROADCAST|RTF_MULTICAST|RTF_MPLS))
+        return;
 
-		mtx_enter(&arp_mtx);
-		if (rt->rt_llinfo != NULL) {
-			/* we lost the race, another thread has entered it */
-			mtx_leave(&arp_mtx);
-			pool_put(&arp_pool, la);
-			break;
-		}
-		mq_init(&la->la_mq, LA_HOLD_QUEUE, IPL_SOFTNET);
-		rt->rt_llinfo = (caddr_t)la;
-		la->la_rt = rt;
-		rt->rt_flags |= RTF_LLINFO;
-		LIST_INSERT_HEAD(&arp_list, la, la_list);
-		if ((rt->rt_flags & RTF_LOCAL) == 0)
-			rt->rt_expire = uptime;
-		mtx_leave(&arp_mtx);
+    uptime = getuptime();
+    switch (req) {
+    case RTM_ADD:
+        if (rt->rt_flags & RTF_CLONING) {
+            rt->rt_expire = 0;
+            break;
+        }
+        if ((rt->rt_flags & RTF_LOCAL) && rt->rt_llinfo == NULL)
+            rt->rt_expire = 0;
+        /*
+         * Announce a new entry if requested or warn the user
+         * if another station has this IP address.
+         */
+        if (rt->rt_flags & (RTF_ANNOUNCE|RTF_LOCAL)) {
+            if (satosin(rt_key(rt)) == NULL || satosdl(gate) == NULL) // Check for NULL pointers
+                return;
+            arprequest(ifp,
+                &satosin(rt_key(rt))->sin_addr.s_addr,
+                &satosin(rt_key(rt))->sin_addr.s_addr,
+                (u_char *)LLADDR(satosdl(gate)));
+        }
+        /*FALLTHROUGH*/
+    case RTM_RESOLVE:
+        if (gate->sa_family != AF_LINK ||
+            gate->sa_len < sizeof(struct sockaddr_dl)) {
+            log(LOG_DEBUG, "%s: bad gateway value: %s\n", __func__,
+                ifp->if_xname);
+            break;
+        }
+        satosdl(gate)->sdl_type = ifp->if_type;
+        satosdl(gate)->sdl_index = ifp->if_index;
+        /*
+         * Case 2:  This route may come from cloning, or a manual route
+         * add with a LL address.
+         */
+        la = pool_get(&arp_pool, PR_NOWAIT | PR_ZERO);
+        if (la == NULL) {
+            log(LOG_DEBUG, "%s: pool get failed\n", __func__);
+            break;
+        }
 
-		break;
+        mtx_enter(&arp_mtx);
+        if (rt->rt_llinfo != NULL) {
+            /* we lost the race, another thread has entered it */
+            mtx_leave(&arp_mtx);
+            pool_put(&arp_pool, la);
+            break;
+        }
+        mq_init(&la->la_mq, LA_HOLD_QUEUE, IPL_SOFTNET);
+        rt->rt_llinfo = (caddr_t)la;
+        la->la_rt = rt;
+        rt->rt_flags |= RTF_LLINFO;
+        LIST_INSERT_HEAD(&arp_list, la, la_list);
+        if ((rt->rt_flags & RTF_LOCAL) == 0)
+            rt->rt_expire = uptime;
+        mtx_leave(&arp_mtx);
 
-	case RTM_DELETE:
-		mtx_enter(&arp_mtx);
-		la = (struct llinfo_arp *)rt->rt_llinfo;
-		if (la == NULL) {
-			/* we lost the race, another thread has removed it */
-			mtx_leave(&arp_mtx);
-			break;
-		}
-		LIST_REMOVE(la, la_list);
-		rt->rt_llinfo = NULL;
-		rt->rt_flags &= ~RTF_LLINFO;
-		atomic_sub_int(&la_hold_total, mq_purge(&la->la_mq));
-		mtx_leave(&arp_mtx);
+        break;
 
-		pool_put(&arp_pool, la);
-		break;
+    case RTM_DELETE:
+        mtx_enter(&arp_mtx);
+        la = (struct llinfo_arp *)rt->rt_llinfo;
+        if (la == NULL) {
+            /* we lost the race, another thread has removed it */
+            mtx_leave(&arp_mtx);
+            break;
+        }
+        LIST_REMOVE(la, la_list);
+        rt->rt_llinfo = NULL;
+        rt->rt_flags &= ~RTF_LLINFO;
+        atomic_sub_int(&la_hold_total, mq_purge(&la->la_mq));
+        mtx_leave(&arp_mtx);
 
-	case RTM_INVALIDATE:
-		if (!ISSET(rt->rt_flags, RTF_LOCAL))
-			arpinvalidate(rt);
-		break;
-	}
+        pool_put(&arp_pool, la);
+        break;
+
+    case RTM_INVALIDATE:
+        if (!ISSET(rt->rt_flags, RTF_LOCAL))
+            arpinvalidate(rt);
+        break;
+    }
 }
 
 /*
@@ -256,36 +293,49 @@ arp_rtrequest(struct ifnet *ifp, int req, struct rtentry *rt)
 void
 arprequest(struct ifnet *ifp, u_int32_t *sip, u_int32_t *tip, u_int8_t *enaddr)
 {
-	struct mbuf *m;
-	struct ether_header *eh;
-	struct ether_arp *ea;
-	struct sockaddr sa;
+    struct mbuf *m;
+    struct ether_header *eh;
+    struct ether_arp *ea;
+    struct sockaddr sa;
 
-	if ((m = m_gethdr(M_DONTWAIT, MT_DATA)) == NULL)
-		return;
-	m->m_len = sizeof(*ea);
-	m->m_pkthdr.len = sizeof(*ea);
-	m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
-	m->m_pkthdr.pf.prio = ifp->if_llprio;
-	m_align(m, sizeof(*ea));
-	ea = mtod(m, struct ether_arp *);
-	eh = (struct ether_header *)sa.sa_data;
-	memset(ea, 0, sizeof(*ea));
-	memcpy(eh->ether_dhost, etherbroadcastaddr, sizeof(eh->ether_dhost));
-	eh->ether_type = htons(ETHERTYPE_ARP);	/* if_output will not swap */
-	ea->arp_hrd = htons(ARPHRD_ETHER);
-	ea->arp_pro = htons(ETHERTYPE_IP);
-	ea->arp_hln = sizeof(ea->arp_sha);	/* hardware address length */
-	ea->arp_pln = sizeof(ea->arp_spa);	/* protocol address length */
-	ea->arp_op = htons(ARPOP_REQUEST);
-	memcpy(eh->ether_shost, enaddr, sizeof(eh->ether_shost));
-	memcpy(ea->arp_sha, enaddr, sizeof(ea->arp_sha));
-	memcpy(ea->arp_spa, sip, sizeof(ea->arp_spa));
-	memcpy(ea->arp_tpa, tip, sizeof(ea->arp_tpa));
-	sa.sa_family = pseudo_AF_HDRCMPLT;
-	sa.sa_len = sizeof(sa);
-	m->m_flags |= M_BCAST;
-	ifp->if_output(ifp, m, &sa, NULL);
+    if (ifp == NULL || sip == NULL || tip == NULL || enaddr == NULL)
+        return;
+
+    if ((m = m_gethdr(M_DONTWAIT, MT_DATA)) == NULL)
+        return;
+    m->m_len = sizeof(*ea);
+    m->m_pkthdr.len = sizeof(*ea);
+    m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
+    m->m_pkthdr.pf.prio = ifp->if_llprio;
+    m_align(m, sizeof(*ea));
+    ea = mtod(m, struct ether_arp *);
+    eh = (struct ether_header *)sa.sa_data;
+
+    if (ea == NULL || eh == NULL)
+    {
+        m_freem(m);
+        return;
+    }
+
+    memset(ea, 0, sizeof(*ea));
+    memcpy(eh->ether_dhost, etherbroadcastaddr, sizeof(eh->ether_dhost));
+    eh->ether_type = htons(ETHERTYPE_ARP);  /* if_output will not swap */
+    ea->arp_hrd = htons(ARPHRD_ETHER);
+    ea->arp_pro = htons(ETHERTYPE_IP);
+    ea->arp_hln = sizeof(ea->arp_sha);  /* hardware address length */
+    ea->arp_pln = sizeof(ea->arp_spa);  /* protocol address length */
+    ea->arp_op = htons(ARPOP_REQUEST);
+
+    memcpy(eh->ether_shost, enaddr, sizeof(eh->ether_shost));
+    memcpy(ea->arp_sha, enaddr, sizeof(ea->arp_sha));
+    memcpy(ea->arp_spa, sip, sizeof(ea->arp_spa));
+    memcpy(ea->arp_tpa, tip, sizeof(ea->arp_tpa));
+
+    sa.sa_family = pseudo_AF_HDRCMPLT;
+    sa.sa_len = sizeof(sa);
+    m->m_flags |= M_BCAST;
+
+    ifp->if_output(ifp, m, &sa, NULL);
 }
 
 void
@@ -296,10 +346,15 @@ arpreply(struct ifnet *ifp, struct mbuf *m, struct in_addr *sip, uint8_t *eaddr,
 	struct ether_arp *ea;
 	struct sockaddr sa;
 
+	if (!ifp || !m || !sip || !eaddr || m->m_len < sizeof(struct ether_arp) || sizeof(sa.sa_data) < sizeof(struct ether_header))
+		return;
+
 	m_resethdr(m);
 	m->m_pkthdr.ph_rtableid = rdomain;
 
 	ea = mtod(m, struct ether_arp *);
+	if (m->m_len < sizeof(*ea))
+		return;
 	ea->arp_op = htons(ARPOP_REPLY);
 	ea->arp_pro = htons(ETHERTYPE_IP); /* let's be sure! */
 
@@ -310,6 +365,8 @@ arpreply(struct ifnet *ifp, struct mbuf *m, struct in_addr *sip, uint8_t *eaddr,
 	memcpy(ea->arp_sha, eaddr, sizeof(ea->arp_sha));
 	memcpy(ea->arp_spa, sip, sizeof(ea->arp_spa));
 
+	if (sizeof(sa.sa_data) < sizeof(*eh))
+		return;
 	eh = (struct ether_header *)sa.sa_data;
 	memcpy(eh->ether_dhost, ea->arp_tha, sizeof(eh->ether_dhost));
 	memcpy(eh->ether_shost, eaddr, sizeof(eh->ether_shost));
@@ -445,15 +502,18 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 		reject = ~RTF_REJECT;
 		if (la->la_asked == 0 || rt->rt_expire != uptime) {
 			rt->rt_expire = uptime;
-			if (la->la_asked++ < arp_maxtries)
+			if (la->la_asked < INT_MAX && la->la_asked++ < arp_maxtries)  {
 				refresh = 1;
-			else {
+			} else {
 				reject = RTF_REJECT;
-				rt->rt_expire += arpt_down;
+				if (rt->rt_expire <= UINT_MAX - arpt_down) { // Avoid integer overflow
+					rt->rt_expire += arpt_down;
+				} else {
+					rt->rt_expire = UINT_MAX; // Set to max value if overflow would occur
+				}
 				la->la_asked = 0;
 				la->la_refreshed = 0;
-				atomic_sub_int(&la_hold_total,
-				    mq_purge(&la->la_mq));
+				atomic_sub_int(&la_hold_total, mq_purge(&la->la_mq));
 			}
 		}
 	}
@@ -490,6 +550,9 @@ arppullup(struct mbuf *m)
 		panic("arp without packet header");
 #endif
 
+	if (m == NULL || m->m_len < 0)
+		return NULL;
+
 	len = sizeof(struct arphdr);
 	if (m->m_len < len && (m = m_pullup(m, len)) == NULL)
 		return NULL;
@@ -503,7 +566,15 @@ arppullup(struct mbuf *m)
 		return NULL;
 	}
 
-	len += 2 * (ar->ar_hln + ar->ar_pln);
+	int hln_pln_sum;
+	if (__builtin_add_overflow(ar->ar_hln, ar->ar_hln, &hln_pln_sum) ||
+	    __builtin_add_overflow(hln_pln_sum, ar->ar_pln, &hln_pln_sum) ||
+	    __builtin_add_overflow(hln_pln_sum, ar->ar_pln, &hln_pln_sum) ||
+	    __builtin_add_overflow(len, hln_pln_sum, &len)) {
+		m_freem(m);
+		return NULL;
+	}
+
 	if (m->m_len < len && (m = m_pullup(m, len)) == NULL)
 		return NULL;
 
@@ -519,6 +590,11 @@ arpinput(struct ifnet *ifp, struct mbuf *m)
 {
 	if ((m = arppullup(m)) == NULL)
 		return;
+	if (m->m_len < 0 || m->m_len > MCLBYTES) // Check for out-of-bounds and overflow
+	{
+		m_freem(m);
+		return;
+	}
 	niq_enqueue(&arpinq, m);
 }
 
@@ -558,6 +634,11 @@ in_arpinput(struct ifnet *ifp, struct mbuf *m)
 	char addr[INET_ADDRSTRLEN];
 	int op, target = 0;
 	unsigned int rdomain;
+
+	if (m == NULL || ifp == NULL || m->m_len < sizeof(struct ether_arp)) {
+		if (m != NULL) m_freem(m);
+		return;
+	}
 
 	rdomain = rtable_l2(m->m_pkthdr.ph_rtableid);
 
@@ -809,6 +890,11 @@ arpproxy(struct in_addr in, unsigned int rtableid)
 	struct rtentry *rt;
 	struct ifnet *ifp;
 	int found = 0;
+	
+	// Check for valid rtableid value to prevent integer overflow
+	if (rtableid > UINT_MAX) {
+		return (0);
+	}
 
 	rt = arplookup(&in, 0, SIN_PROXY, rtableid);
 	if (!rtisvalid(rt)) {
@@ -818,13 +904,20 @@ arpproxy(struct in_addr in, unsigned int rtableid)
 
 	/* Check that arp information are correct. */
 	sdl = satosdl(rt->rt_gateway);
-	if (sdl->sdl_alen != ETHER_ADDR_LEN) {
+	if (sdl == NULL || sdl->sdl_alen != ETHER_ADDR_LEN) {
 		rtfree(rt);
 		return (0);
 	}
 
 	ifp = if_get(rt->rt_ifidx);
 	if (ifp == NULL) {
+		rtfree(rt);
+		return (0);
+	}
+
+	// Check that sdl_alen does not exceed the bounds of LLADDR
+	if (sdl->sdl_alen <= 0 || sdl->sdl_alen > sizeof(ifp->if_sadl->sdl_data)) {
+		if_put(ifp);
 		rtfree(rt);
 		return (0);
 	}
@@ -846,8 +939,12 @@ arpproxy(struct in_addr in, unsigned int rtableid)
 void
 revarpinput(struct ifnet *ifp, struct mbuf *m)
 {
+	if (ifp == NULL || m == NULL)
+		return;
+
 	if ((m = arppullup(m)) == NULL)
 		return;
+
 	in_revarpinput(ifp, m);
 }
 
@@ -868,8 +965,19 @@ in_revarpinput(struct ifnet *ifp, struct mbuf *m)
 	struct ether_arp *ar;
 	int op;
 
+	// Check for integer overflow
+	if (m->m_pkthdr.len < sizeof(struct ether_arp)) {
+		goto out;
+	}
+
 	ar = mtod(m, struct ether_arp *);
 	op = ntohs(ar->arp_op);
+
+	// Ensure op is within the valid range for ARP operations
+	if (op < 0 || op > UINT16_MAX) {
+		goto out;
+	}
+
 	switch (op) {
 	case ARPOP_REQUEST:
 	case ARPOP_REPLY:	/* per RFC */
@@ -888,6 +996,14 @@ in_revarpinput(struct ifnet *ifp, struct mbuf *m)
 		goto out;
 	if (revarp_finished)
 		goto wake;
+
+	// Ensure memcmp and memcpy are within bounds
+	if (sizeof(ar->arp_tha) > sizeof(ifp->if_sadl->sdl_data) || 
+	    sizeof(ar->arp_spa) > sizeof(revarp_srvip) || 
+	    sizeof(ar->arp_tpa) > sizeof(revarp_myip)) {
+		goto out;
+	}
+
 	if (memcmp(ar->arp_tha, LLADDR(ifp->if_sadl), sizeof(ar->arp_tha)))
 		goto out;
 	memcpy(&revarp_srvip, ar->arp_spa, sizeof(revarp_srvip));
@@ -922,7 +1038,15 @@ revarprequest(struct ifnet *ifp)
 	m->m_pkthdr.pf.prio = ifp->if_llprio;
 	m_align(m, sizeof(*ea));
 	ea = mtod(m, struct ether_arp *);
+	if (ea == NULL) {
+		m_freem(m);
+		return;
+	}
 	eh = (struct ether_header *)sa.sa_data;
+	if (eh == NULL) {
+		m_freem(m);
+		return;
+	}
 	memset(ea, 0, sizeof(*ea));
 	memcpy(eh->ether_dhost, etherbroadcastaddr, sizeof(eh->ether_dhost));
 	eh->ether_type = htons(ETHERTYPE_REVARP);
@@ -955,6 +1079,12 @@ revarpwhoarewe(struct ifnet *ifp, struct in_addr *serv_in,
 	if (revarp_finished)
 		return EIO;
 
+	if (ifp == NULL || serv_in == NULL || clnt_in == NULL)
+		return EINVAL;
+
+	if (ifp->if_index < 0) // Ensure if_index is non-negative
+		return EINVAL;
+
 	revarp_ifidx = ifp->if_index;
 	while (count--) {
 		revarprequest(ifp);
@@ -976,6 +1106,9 @@ revarpwhoarewe(struct ifnet *ifp, struct in_addr *serv_in,
 int
 revarpwhoami(struct in_addr *in, struct ifnet *ifp)
 {
+	if (in == NULL || ifp == NULL) {
+		return -1; // Return an error code for invalid input
+	}
 	struct in_addr server;
 	return (revarpwhoarewe(ifp, &server, in));
 }

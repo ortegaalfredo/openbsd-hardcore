@@ -204,16 +204,16 @@ ip_init(void)
 
 	/* Fill in list of ports not to allocate dynamically. */
 	memset(&baddynamicports, 0, sizeof(baddynamicports));
-	for (i = 0; defbaddynamicports_tcp[i] != 0; i++)
+	for (i = 0; i < sizeof(defbaddynamicports_tcp) / sizeof(defbaddynamicports_tcp[0]) && defbaddynamicports_tcp[i] != 0; i++)
 		DP_SET(baddynamicports.tcp, defbaddynamicports_tcp[i]);
-	for (i = 0; defbaddynamicports_udp[i] != 0; i++)
+	for (i = 0; i < sizeof(defbaddynamicports_udp) / sizeof(defbaddynamicports_udp[0]) && defbaddynamicports_udp[i] != 0; i++)
 		DP_SET(baddynamicports.udp, defbaddynamicports_udp[i]);
 
 	/* Fill in list of ports only root can bind to. */
 	memset(&rootonlyports, 0, sizeof(rootonlyports));
-	for (i = 0; defrootonlyports_tcp[i] != 0; i++)
+	for (i = 0; i < sizeof(defrootonlyports_tcp) / sizeof(defrootonlyports_tcp[0]) && defrootonlyports_tcp[i] != 0; i++)
 		DP_SET(rootonlyports.tcp, defrootonlyports_tcp[i]);
-	for (i = 0; defrootonlyports_udp[i] != 0; i++)
+	for (i = 0; i < sizeof(defrootonlyports_udp) / sizeof(defrootonlyports_udp[0]) && defrootonlyports_udp[i] != 0; i++)
 		DP_SET(rootonlyports.udp, defrootonlyports_udp[i]);
 
 	mq_init(&ipsend_mq, 64, IPL_SOFTNET);
@@ -237,6 +237,22 @@ ip_init(void)
 int
 ip_ours(struct mbuf **mp, int *offp, int nxt, int af)
 {
+	/* Check for null pointers to avoid dereferencing null pointers */
+	if (mp == NULL || offp == NULL)
+		return IPPROTO_DONE;
+
+	/* Validate that *mp is not null */
+	if (*mp == NULL)
+		return IPPROTO_DONE;
+
+	/* Check for integer overflow for *offp */
+	if (*offp < 0)
+		return IPPROTO_DONE;
+
+	/* Ensure nxt is within a valid range to avoid undefined behavior */
+	if (nxt < 0 || nxt > 255)
+		return IPPROTO_DONE;
+
 	nxt = ip_fragcheck(mp, offp);
 	if (nxt == IPPROTO_DONE)
 		return IPPROTO_DONE;
@@ -268,9 +284,23 @@ ipintr(void)
 			panic("ipintr no HDR");
 #endif
 		ip = mtod(m, struct ip *);
-		off = ip->ip_hl << 2;
-		nxt = ip->ip_p;
+		if (ip == NULL || m->m_len < sizeof(struct ip)) {
+			m_freem(m);
+			continue;
+		}
+		
+		if (ip->ip_hl < 5 || ip->ip_hl > 15) {
+			m_freem(m);
+			continue;
+		}
 
+		off = ip->ip_hl << 2;
+		if (off > m->m_len) {
+			m_freem(m);
+			continue;
+		}
+
+		nxt = ip->ip_p;
 		nxt = ip_deliver(&m, &off, nxt, AF_INET);
 		KASSERT(nxt == IPPROTO_DONE);
 	}
@@ -286,8 +316,15 @@ ipv4_input(struct ifnet *ifp, struct mbuf *m)
 {
 	int off, nxt;
 
+	if (m == NULL || ifp == NULL)
+		return;
+		
 	off = 0;
 	nxt = ip_input_if(&m, &off, IPPROTO_IPV4, AF_UNSPEC, ifp);
+
+	if (nxt < 0 || nxt > IPPROTO_MAX)
+		return;
+
 	KASSERT(nxt == IPPROTO_DONE);
 }
 
@@ -353,9 +390,17 @@ ipv4_check(struct ifnet *ifp, struct mbuf *m)
 	len = ntohs(ip->ip_len);
 
 	/*
-	 * Convert fields to host representation.
+	 * Validate packet length against header length.
 	 */
 	if (len < hlen) {
+		ipstat_inc(ips_badlen);
+		goto bad;
+	}
+
+	/*
+	 * Check for integer overflow in packet length.
+	 */
+	if (len > IP_MAXPACKET) {
 		ipstat_inc(ips_badlen);
 		goto bad;
 	}
@@ -466,6 +511,10 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 			int error;
 
 			if (m->m_flags & M_EXT) {
+				if (hlen < 0 || hlen > m->m_len) {
+					ipstat_inc(ips_toosmall);
+					goto bad;
+				}
 				if ((m = *mp = m_pullup(m, hlen)) == NULL) {
 					ipstat_inc(ips_toosmall);
 					goto bad;
@@ -498,6 +547,9 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 			 * host belongs to their destination groups.
 			 */
 			if (ip->ip_p == IPPROTO_IGMP) {
+				if (*offp < 0 || *offp >= m->m_len) {
+					goto bad;
+				}
 				nxt = ip_ours(mp, offp, nxt, af);
 				goto out;
 			}
@@ -591,7 +643,13 @@ ip_fragcheck(struct mbuf **mp, int *offp)
 		 * set ipqe_mff if more fragments are expected,
 		 * convert offset of this to bytes.
 		 */
-		ip->ip_len = htons(ntohs(ip->ip_len) - hlen);
+		uint16_t ip_len = ntohs(ip->ip_len);
+		if (hlen > ip_len) {
+			ipstat_inc(ips_badlen);
+			m_freemp(mp);
+			return IPPROTO_DONE;
+		}
+		ip->ip_len = htons(ip_len - hlen);
 		mff = ISSET(ip->ip_off, htons(IP_MF));
 		if (mff) {
 			/*
@@ -649,7 +707,13 @@ ip_fragcheck(struct mbuf **mp, int *offp)
 			ipstat_inc(ips_reassembled);
 			ip = mtod(*mp, struct ip *);
 			hlen = ip->ip_hl << 2;
-			ip->ip_len = htons(ntohs(ip->ip_len) + hlen);
+			ip_len = ntohs(ip->ip_len);
+			if (hlen > ip_len) {
+				ipstat_inc(ips_badlen);
+				m_freemp(mp);
+				return IPPROTO_DONE;
+			}
+			ip->ip_len = htons(ip_len + hlen);
 		} else {
 			if (fp != NULL)
 				ip_freef(fp);
@@ -710,6 +774,10 @@ ip_deliver(struct mbuf **mp, int *offp, int nxt, int af)
 
 #ifdef IPSEC
 		if (ipsec_in_use) {
+			if (*offp < 0 || *offp >= INT_MAX - sizeof(*mp) || *offp >= INT_MAX - sizeof(nxt) || *offp >= INT_MAX - sizeof(af)) {
+				IPSTAT_INC(cantforward);
+				goto bad;
+			}
 			if (ipsec_local_check(*mp, *offp, nxt, af) != 0) {
 				IPSTAT_INC(cantforward);
 				goto bad;
@@ -753,105 +821,108 @@ ip_deliver(struct mbuf **mp, int *offp, int nxt, int af)
 int
 in_ouraddr(struct mbuf *m, struct ifnet *ifp, struct rtentry **prt)
 {
-	struct rtentry		*rt;
-	struct ip		*ip;
-	struct sockaddr_in	 sin;
-	int			 match = 0;
+    struct rtentry     *rt;
+    struct ip          *ip;
+    struct sockaddr_in  sin;
+    int                 match = 0;
 
 #if NPF > 0
-	switch (pf_ouraddr(m)) {
-	case 0:
-		return (0);
-	case 1:
-		return (1);
-	default:
-		/* pf does not know it */
-		break;
-	}
+    switch (pf_ouraddr(m)) {
+    case 0:
+        return (0);
+    case 1:
+        return (1);
+    default:
+        /* pf does not know it */
+        break;
+    }
 #endif
 
-	ip = mtod(m, struct ip *);
+    if (m->m_len < sizeof(struct ip))    // Check for out-of-bounds access
+        return (0);
 
-	memset(&sin, 0, sizeof(sin));
-	sin.sin_len = sizeof(sin);
-	sin.sin_family = AF_INET;
-	sin.sin_addr = ip->ip_dst;
-	rt = rtalloc_mpath(sintosa(&sin), &ip->ip_src.s_addr,
-	    m->m_pkthdr.ph_rtableid);
-	if (rtisvalid(rt)) {
-		if (ISSET(rt->rt_flags, RTF_LOCAL))
-			match = 1;
+    ip = mtod(m, struct ip *);
 
-		/*
-		 * If directedbcast is enabled we only consider it local
-		 * if it is received on the interface with that address.
-		 */
-		if (ISSET(rt->rt_flags, RTF_BROADCAST) &&
-		    (!ip_directedbcast || rt->rt_ifidx == ifp->if_index)) {
-			match = 1;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_len = sizeof(sin);
+    sin.sin_family = AF_INET;
+    sin.sin_addr = ip->ip_dst;
+    rt = rtalloc_mpath(sintosa(&sin), &ip->ip_src.s_addr,
+        m->m_pkthdr.ph_rtableid);
+    if (rtisvalid(rt)) {
+        if (ISSET(rt->rt_flags, RTF_LOCAL))
+            match = 1;
 
-			/* Make sure M_BCAST is set */
-			m->m_flags |= M_BCAST;
-		}
-	}
-	*prt = rt;
+        /*
+         * If directedbcast is enabled we only consider it local
+         * if it is received on the interface with that address.
+         */
+        if (ISSET(rt->rt_flags, RTF_BROADCAST) &&
+            (!ip_directedbcast || rt->rt_ifidx == ifp->if_index)) {
+            match = 1;
 
-	if (!match) {
-		struct ifaddr *ifa;
+            /* Make sure M_BCAST is set */
+            m->m_flags |= M_BCAST;
+        }
+    }
+    *prt = rt;
 
-		/*
-		 * No local address or broadcast address found, so check for
-		 * ancient classful broadcast addresses.
-		 * It must have been broadcast on the link layer, and for an
-		 * address on the interface it was received on.
-		 */
-		if (!ISSET(m->m_flags, M_BCAST) ||
-		    !IN_CLASSFULBROADCAST(ip->ip_dst.s_addr, ip->ip_dst.s_addr))
-			return (0);
+    if (!match) {
+        struct ifaddr *ifa;
 
-		if (ifp->if_rdomain != rtable_l2(m->m_pkthdr.ph_rtableid))
-			return (0);
-		/*
-		 * The check in the loop assumes you only rx a packet on an UP
-		 * interface, and that M_BCAST will only be set on a BROADCAST
-		 * interface.
-		 */
-		NET_ASSERT_LOCKED();
-		TAILQ_FOREACH(ifa, &ifp->if_addrlist, ifa_list) {
-			if (ifa->ifa_addr->sa_family != AF_INET)
-				continue;
+        /*
+         * No local address or broadcast address found, so check for
+         * ancient classful broadcast addresses.
+         * It must have been broadcast on the link layer, and for an
+         * address on the interface it was received on.
+         */
+        if (!ISSET(m->m_flags, M_BCAST) ||
+            !IN_CLASSFULBROADCAST(ip->ip_dst.s_addr, ip->ip_dst.s_addr))
+            return (0);
 
-			if (IN_CLASSFULBROADCAST(ip->ip_dst.s_addr,
-			    ifatoia(ifa)->ia_addr.sin_addr.s_addr)) {
-				match = 1;
-				break;
-			}
-		}
-	} else if (ipforwarding == 0 && rt->rt_ifidx != ifp->if_index &&
-	    !((ifp->if_flags & IFF_LOOPBACK) || (ifp->if_type == IFT_ENC) ||
-	    (m->m_pkthdr.pf.flags & PF_TAG_TRANSLATE_LOCALHOST))) {
-		/* received on wrong interface. */
+        if (ifp->if_rdomain != rtable_l2(m->m_pkthdr.ph_rtableid))
+            return (0);
+        /*
+         * The check in the loop assumes you only rx a packet on an UP
+         * interface, and that M_BCAST will only be set on a BROADCAST
+         * interface.
+         */
+        NET_ASSERT_LOCKED();
+        TAILQ_FOREACH(ifa, &ifp->if_addrlist, ifa_list) {
+            if (ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+
+            if (IN_CLASSFULBROADCAST(ip->ip_dst.s_addr,
+                ifatoia(ifa)->ia_addr.sin_addr.s_addr)) {
+                match = 1;
+                break;
+            }
+        }
+    } else if (ipforwarding == 0 && rt->rt_ifidx != ifp->if_index &&
+        !((ifp->if_flags & IFF_LOOPBACK) || (ifp->if_type == IFT_ENC) ||
+        (m->m_pkthdr.pf.flags & PF_TAG_TRANSLATE_LOCALHOST))) {
+        /* received on wrong interface. */
 #if NCARP > 0
-		struct ifnet *out_if;
+        struct ifnet *out_if;
 
-		/*
-		 * Virtual IPs on carp interfaces need to be checked also
-		 * against the parent interface and other carp interfaces
-		 * sharing the same parent.
-		 */
-		out_if = if_get(rt->rt_ifidx);
-		if (!(out_if && carp_strict_addr_chk(out_if, ifp))) {
-			ipstat_inc(ips_wrongif);
-			match = 2;
-		}
-		if_put(out_if);
+        /*
+         * Virtual IPs on carp interfaces need to be checked also
+         * against the parent interface and other carp interfaces
+         * sharing the same parent.
+         */
+        out_if = if_get(rt->rt_ifidx);
+        if (!(out_if && carp_strict_addr_chk(out_if, ifp))) {
+            ipstat_inc(ips_wrongif);
+            match = 2;
+        }
+        if_put(out_if);
 #else
-		ipstat_inc(ips_wrongif);
-		match = 2;
+        ipstat_inc(ips_wrongif);
+        match = 2;
 #endif
-	}
+    }
 
-	return (match);
+    return (match);
 }
 
 /*
@@ -1052,10 +1123,14 @@ ip_freef(struct ipq *fp)
 		LIST_REMOVE(q, ipqe_q);
 		m_freem(q->ipqe_m);
 		pool_put(&ipqent_pool, q);
-		ip_frags--;
+		if (ip_frags > 0) {
+			ip_frags--;
+		}
 	}
-	LIST_REMOVE(fp, ipq_q);
-	pool_put(&ipq_pool, fp);
+	if (fp != NULL) {
+		LIST_REMOVE(fp, ipq_q);
+		pool_put(&ipq_pool, fp);
+	}
 }
 
 /*
@@ -1069,7 +1144,7 @@ ip_slowtimo(void)
 
 	mtx_enter(&ipq_mutex);
 	LIST_FOREACH_SAFE(fp, &ipq, ipq_q, nfp) {
-		if (--fp->ipq_ttl == 0) {
+		if (fp->ipq_ttl > 0 && --fp->ipq_ttl == 0) {
 			ipstat_inc(ips_fragtimeout);
 			ip_freef(fp);
 		}
@@ -1087,9 +1162,10 @@ ip_flush(void)
 
 	MUTEX_ASSERT_LOCKED(&ipq_mutex);
 
-	while (!LIST_EMPTY(&ipq) && ip_frags > ip_maxqueue * 3 / 4 && --max) {
+	while (max > 0 && !LIST_EMPTY(&ipq) && ip_frags > 0 && ip_frags > ip_maxqueue * 3 / 4) {
 		ipstat_inc(ips_fragdropped);
 		ip_freef(LIST_FIRST(&ipq));
+		--max;
 	}
 }
 
@@ -1345,7 +1421,10 @@ save_rte(struct mbuf *m, u_char *option, struct in_addr dst)
 	struct m_tag *mtag;
 	unsigned olen;
 
-	olen = option[IPOPT_OLEN];
+	// Check that option pointer is valid and that the length byte is within valid range
+	if (option == NULL || (olen = option[IPOPT_OLEN]) < IPOPT_OFFSET + 1) 
+		return;
+	
 	if (olen > sizeof(isr->isr_hdr) + sizeof(isr->isr_routes))
 		return;
 
@@ -1356,8 +1435,17 @@ save_rte(struct mbuf *m, u_char *option, struct in_addr dst)
 	}
 	isr = (struct ip_srcrt *)(mtag + 1);
 
+	// Ensure that memcpy does not read beyond the bounds of the option array
+	if (olen > sizeof(*option) * (option ? sizeof(option) : 1))
+		return;
+
 	memcpy(isr->isr_hdr, option, olen);
+
+	// Ensure that calculation does not result in negative value or overflow
+	if (olen < IPOPT_OFFSET + 1)
+		return;
 	isr->isr_nhops = (olen - IPOPT_OFFSET - 1) / sizeof(struct in_addr);
+	
 	isr->isr_dst = dst;
 	m_tag_prepend(m, mtag);
 }
@@ -1383,8 +1471,9 @@ ip_srcroute(struct mbuf *m0)
 		return (NULL);
 	isr = (struct ip_srcrt *)(mtag + 1);
 
-	if (isr->isr_nhops == 0)
-		return (NULL);
+	if (isr->isr_nhops == 0 || isr->isr_nhops > (INT_MAX / sizeof(struct in_addr)) - 1)
+	    return (NULL);
+
 	m = m_get(M_DONTWAIT, MT_SOOPTS);
 	if (m == NULL) {
 		ipstat_inc(ips_idropped);
@@ -1396,10 +1485,19 @@ ip_srcroute(struct mbuf *m0)
 	/* length is (nhops+1)*sizeof(addr) + sizeof(nop + header) */
 	m->m_len = (isr->isr_nhops + 1) * sizeof(struct in_addr) + OPTSIZ;
 
+	if (m->m_len > MCLBYTES) {
+		m_freem(m);
+		return (NULL);
+	}
+
 	/*
 	 * First save first hop for return route
 	 */
 	p = &(isr->isr_routes[isr->isr_nhops - 1]);
+	if (p < isr->isr_routes) {
+		m_freem(m);
+		return (NULL);
+	}
 	*(mtod(m, struct in_addr *)) = *p--;
 
 	/*
@@ -1438,10 +1536,20 @@ ip_stripoptions(struct mbuf *m)
 	caddr_t opts;
 	int olen;
 
-	olen = (ip->ip_hl<<2) - sizeof (struct ip);
+	if (m == NULL || m->m_len < sizeof(struct ip))
+		return;
+
+	olen = (ip->ip_hl << 2) - sizeof(struct ip);
+	if (olen < 0 || olen > m->m_len - sizeof(struct ip))
+		return;
+
 	opts = (caddr_t)(ip + 1);
-	i = m->m_len - (sizeof (struct ip) + olen);
-	memmove(opts, opts  + olen, i);
+	i = m->m_len - (sizeof(struct ip) + olen);
+
+	if (i < 0 || opts + olen > ((caddr_t)m + m->m_len) || opts + olen + i > ((caddr_t)m + m->m_len))
+		return;
+
+	memmove(opts, opts + olen, i);
 	m->m_len -= olen;
 	if (m->m_flags & M_PKTHDR)
 		m->m_pkthdr.len -= olen;
@@ -1754,8 +1862,17 @@ ip_sysctl_ipstat(void *oldp, size_t *oldlenp, void *newp)
 	memset(&ipstat, 0, sizeof ipstat);
 	counters_read(ipcounters, counters, nitems(counters), NULL);
 
-	for (i = 0; i < nitems(counters); i++)
+	size_t counters_size = nitems(counters);
+	if (counters_size > sizeof(ipstat) / sizeof(u_long)) {
+		return -1; // Handle error appropriately
+	}
+
+	for (i = 0; i < counters_size; i++) {
+		if (counters[i] > ULONG_MAX) {
+			return -1; // Handle error appropriately
+		}
 		words[i] = (u_long)counters[i];
+	}
 
 	return (sysctl_rdstruct(oldp, oldlenp, newp, &ipstat, sizeof(ipstat)));
 }
@@ -1780,6 +1897,7 @@ ip_savecontrol(struct inpcb *inp, struct mbuf **mp, struct ip *ip,
 		if (*mp)
 			mp = &(*mp)->m_next;
 	}
+
 #ifdef notyet
 	/* this code is broken and will probably never be fixed. */
 	/* options were tossed already */
@@ -1860,10 +1978,15 @@ ip_send_do_dispatch(void *xmq, int flags)
 	while ((m = ml_dequeue(&ml)) != NULL) {
 		u_int32_t ipsecflowinfo = 0;
 
-		if ((mtag = m_tag_find(m, PACKET_TAG_IPSEC_FLOWINFO, NULL))
-		    != NULL) {
-			ipsecflowinfo = *(u_int32_t *)(mtag + 1);
-			m_tag_delete(m, mtag);
+		if ((mtag = m_tag_find(m, PACKET_TAG_IPSEC_FLOWINFO, NULL)) != NULL) {
+			// Ensure mtag is within bounds before accessing it
+			if ((char *)(mtag + 1) <= (char *)mtag + sizeof(struct m_tag)) {
+				ipsecflowinfo = *(u_int32_t *)(mtag + 1);
+				m_tag_delete(m, mtag);
+			} else {
+				// Handle error for out-of-bounds access
+				continue;
+			}
 		}
 		ip_output(m, NULL, NULL, flags, NULL, NULL, ipsecflowinfo);
 	}
@@ -1873,13 +1996,27 @@ ip_send_do_dispatch(void *xmq, int flags)
 void
 ip_sendraw_dispatch(void *xmq)
 {
-	ip_send_do_dispatch(xmq, IP_RAWOUTPUT);
+    // Check for NULL pointer
+    if (xmq == NULL) {
+        return;
+    }
+
+    // Check for integer overflow/underflow in case IP_RAWOUTPUT is an addition or involves scaling
+    if (IP_RAWOUTPUT > INT_MAX || IP_RAWOUTPUT < INT_MIN) {
+        return;
+    }
+
+    ip_send_do_dispatch(xmq, IP_RAWOUTPUT);
 }
 
 void
 ip_send_dispatch(void *xmq)
 {
-	ip_send_do_dispatch(xmq, 0);
+    if (xmq == NULL || (uintptr_t)xmq > SIZE_MAX - sizeof(uint32_t)) {
+        return;
+    }
+
+    ip_send_do_dispatch(xmq, 0);
 }
 
 void

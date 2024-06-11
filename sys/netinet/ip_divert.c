@@ -263,33 +263,49 @@ divert_packet(struct mbuf *m, int dir, u_int16_t divert_port)
 int
 divert_attach(struct socket *so, int proto, int wait)
 {
-	int error;
+    int error;
 
-	if (so->so_pcb != NULL)
-		return EINVAL;
-	if ((so->so_state & SS_PRIV) == 0)
-		return EACCES;
+    if (so == NULL || so->so_pcb != NULL)
+        return EINVAL;
+    if ((so->so_state & SS_PRIV) == 0)
+        return EACCES;
 
-	error = in_pcballoc(so, &divbtable, wait);
-	if (error)
-		return error;
+    error = in_pcballoc(so, &divbtable, wait);
+    if (error)
+        return error;
 
-	error = soreserve(so, divert_sendspace, divert_recvspace);
-	if (error)
-		return error;
+    if (divert_sendspace < 0 || divert_recvspace < 0)
+        return EINVAL;
 
-	sotoinpcb(so)->inp_flags |= INP_HDRINCL;
-	return (0);
+    error = soreserve(so, divert_sendspace, divert_recvspace);
+    if (error)
+        return error;
+
+    struct inpcb *inp = sotoinpcb(so);
+    if (inp == NULL)
+        return EINVAL;
+
+    inp->inp_flags |= INP_HDRINCL;
+    return 0;
 }
 
 int
 divert_detach(struct socket *so)
 {
+	if (so == NULL)
+		return (EINVAL);
+
 	struct inpcb *inp = sotoinpcb(so);
+
+	if ((uintptr_t)so > (uintptr_t)UINTPTR_MAX - sizeof(struct socket))
+		return (EINVAL);
 
 	soassertlocked(so);
 
 	if (inp == NULL)
+		return (EINVAL);
+
+	if ((uintptr_t)inp > (uintptr_t)UINTPTR_MAX - sizeof(struct inpcb))
 		return (EINVAL);
 
 	in_pcbdetach(inp);
@@ -299,7 +315,9 @@ divert_detach(struct socket *so)
 void
 divert_lock(struct socket *so)
 {
+	if (so == NULL) return; // Check for NULL pointer
 	struct inpcb *inp = sotoinpcb(so);
+	if (inp == NULL) return; // Check for NULL pointer
 
 	NET_ASSERT_LOCKED();
 	mtx_enter(&inp->inp_mtx);
@@ -308,7 +326,15 @@ divert_lock(struct socket *so)
 void
 divert_unlock(struct socket *so)
 {
+	if (so == NULL) {
+		return;
+	}
+
 	struct inpcb *inp = sotoinpcb(so);
+
+	if (inp == NULL) {
+		return;
+	}
 
 	NET_ASSERT_LOCKED();
 	mtx_leave(&inp->inp_mtx);
@@ -319,13 +345,27 @@ divert_locked(struct socket *so)
 {
 	struct inpcb *inp = sotoinpcb(so);
 
+	if (!inp)
+		return 0;
+
+	if ((char *)&inp->inp_mtx < (char *)inp || (char *)&inp->inp_mtx >= ((char *)inp + sizeof(struct inpcb)))
+		return 0;
+
 	return mtx_owned(&inp->inp_mtx);
 }
 
 int
 divert_bind(struct socket *so, struct mbuf *addr, struct proc *p)
 {
-	struct inpcb *inp = sotoinpcb(so);
+	struct inpcb *inp;
+
+	if (so == NULL || addr == NULL || p == NULL)
+		return EINVAL;
+
+	inp = sotoinpcb(so);
+
+	if (inp == NULL)
+		return EINVAL;
 
 	soassertlocked(so);
 	return in_pcbbind(inp, addr, p);
@@ -334,9 +374,13 @@ divert_bind(struct socket *so, struct mbuf *addr, struct proc *p)
 int
 divert_shutdown(struct socket *so)
 {
-	soassertlocked(so);
-	socantsendmore(so);
-	return (0);
+    if (so == NULL) {
+        return -1; // Handle null pointer case
+    }
+
+    soassertlocked(so);
+    socantsendmore(so);
+    return (0);
 }
 
 int
@@ -375,22 +419,34 @@ int
 divert_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-	int error;
+    int error;
 
-	/* All sysctl names at this level are terminal. */
-	if (namelen != 1)
-		return (ENOTDIR);
+    /* All sysctl names at this level are terminal. */
+    if (namelen != 1)
+        return (ENOTDIR);
 
-	switch (name[0]) {
-	case DIVERTCTL_STATS:
-		return (divert_sysctl_divstat(oldp, oldlenp, newp));
-	default:
-		NET_LOCK();
-		error = sysctl_bounded_arr(divertctl_vars,
-		    nitems(divertctl_vars), name, namelen, oldp, oldlenp, newp,
-		    newlen);
-		NET_UNLOCK();
-		return (error);
-	}
-	/* NOTREACHED */
+    /* Check for potential NULL pointer dereferences */
+    if (name == NULL || oldlenp == NULL || (newp != NULL && newlen == 0)) {
+        return (EINVAL);
+    }
+
+    /* Check for invalid values that could cause integer overflow */
+    if ((uintptr_t)name > UINTPTR_MAX - (sizeof(int) * namelen) || 
+        (uintptr_t)oldp > UINTPTR_MAX - *oldlenp || 
+        (uintptr_t)newp > UINTPTR_MAX - newlen) {
+        return (EINVAL);
+    }
+
+    switch (name[0]) {
+    case DIVERTCTL_STATS:
+        return (divert_sysctl_divstat(oldp, oldlenp, newp));
+    default:
+        NET_LOCK();
+        error = sysctl_bounded_arr(divertctl_vars,
+            nitems(divertctl_vars), name, namelen, oldp, oldlenp, newp,
+            newlen);
+        NET_UNLOCK();
+        return (error);
+    }
+    /* NOTREACHED */
 }

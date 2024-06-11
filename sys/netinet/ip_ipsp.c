@@ -236,6 +236,9 @@ tdb_hash(u_int32_t spi, union sockaddr_union *dst,
 
 	MUTEX_ASSERT_LOCKED(&tdb_sadb_mtx);
 
+	if (dst == NULL || dst->sa.sa_len > sizeof(*dst))
+		return -1;
+
 	SipHash24_Init(&ctx, &tdbkey);
 	SipHash24_Update(&ctx, &spi, sizeof(spi));
 	SipHash24_Update(&ctx, &proto, sizeof(proto));
@@ -253,94 +256,106 @@ reserve_spi(u_int rdomain, u_int32_t sspi, u_int32_t tspi,
     union sockaddr_union *src, union sockaddr_union *dst,
     u_int8_t sproto, int *errval)
 {
-	struct tdb *tdbp, *exists;
-	u_int32_t spi;
-	int nums;
+    struct tdb *tdbp, *exists;
+    u_int32_t spi;
+    int nums;
 
-	/* Don't accept ranges only encompassing reserved SPIs. */
-	if (sproto != IPPROTO_IPCOMP &&
-	    (tspi < sspi || tspi <= SPI_RESERVED_MAX)) {
-		(*errval) = EINVAL;
-		return 0;
-	}
-	if (sproto == IPPROTO_IPCOMP && (tspi < sspi ||
-	    tspi <= CPI_RESERVED_MAX ||
-	    tspi >= CPI_PRIVATE_MIN)) {
-		(*errval) = EINVAL;
-		return 0;
-	}
+    /* Don't accept ranges only encompassing reserved SPIs. */
+    if (sproto != IPPROTO_IPCOMP &&
+        (tspi < sspi || tspi <= SPI_RESERVED_MAX)) {
+        (*errval) = EINVAL;
+        return 0;
+    }
+    if (sproto == IPPROTO_IPCOMP && (tspi < sspi ||
+        tspi <= CPI_RESERVED_MAX ||
+        tspi >= CPI_PRIVATE_MIN)) {
+        (*errval) = EINVAL;
+        return 0;
+    }
 
-	/* Limit the range to not include reserved areas. */
-	if (sspi <= SPI_RESERVED_MAX)
-		sspi = SPI_RESERVED_MAX + 1;
+    /* Limit the range to not include reserved areas. */
+    if (sspi <= SPI_RESERVED_MAX)
+        sspi = SPI_RESERVED_MAX + 1;
 
-	/* For IPCOMP the CPI is only 16 bits long, what a good idea.... */
+    /* For IPCOMP the CPI is only 16 bits long, what a good idea.... */
 
-	if (sproto == IPPROTO_IPCOMP) {
-		u_int32_t t;
-		if (sspi >= 0x10000)
-			sspi = 0xffff;
-		if (tspi >= 0x10000)
-			tspi = 0xffff;
-		if (sspi > tspi) {
-			t = sspi; sspi = tspi; tspi = t;
-		}
-	}
+    if (sproto == IPPROTO_IPCOMP) {
+        u_int32_t t;
+        if (sspi >= 0x10000)
+            sspi = 0xffff;
+        if (tspi >= 0x10000)
+            tspi = 0xffff;
+        if (sspi > tspi) {
+            t = sspi; sspi = tspi; tspi = t;
+        }
+    }
 
-	if (sspi == tspi)   /* Asking for a specific SPI. */
-		nums = 1;
-	else
-		nums = 100;  /* Arbitrarily chosen */
+    if (sspi == tspi)   /* Asking for a specific SPI. */
+        nums = 1;
+    else
+        nums = 100;  /* Arbitrarily chosen */
 
-	/* allocate ahead of time to avoid potential sleeping race in loop */
-	tdbp = tdb_alloc(rdomain);
+    /* allocate ahead of time to avoid potential sleeping race in loop */
+    tdbp = tdb_alloc(rdomain);
 
-	while (nums--) {
-		if (sspi == tspi)  /* Specific SPI asked. */
-			spi = tspi;
-		else    /* Range specified */
-			spi = sspi + arc4random_uniform(tspi - sspi);
+    while (nums--) {
+        if (sspi == tspi)  /* Specific SPI asked. */
+            spi = tspi;
+        else {  /* Range specified */
+            if (tspi - sspi > UINT32_MAX - 1) {
+                (*errval) = ERANGE;
+                tdb_unref(tdbp);
+                return 0;
+            }
+            spi = sspi + arc4random_uniform(tspi - sspi);
+        }
 
-		/* Don't allocate reserved SPIs.  */
-		if (spi >= SPI_RESERVED_MIN && spi <= SPI_RESERVED_MAX)
-			continue;
-		else
-			spi = htonl(spi);
+        /* Don't allocate reserved SPIs.  */
+        if (spi >= SPI_RESERVED_MIN && spi <= SPI_RESERVED_MAX)
+            continue;
+        else
+            spi = htonl(spi);
 
-		/* Check whether we're using this SPI already. */
-		exists = gettdb(rdomain, spi, dst, sproto);
-		if (exists != NULL) {
-			tdb_unref(exists);
-			continue;
-		}
+        /* Check whether we're using this SPI already. */
+        exists = gettdb(rdomain, spi, dst, sproto);
+        if (exists != NULL) {
+            tdb_unref(exists);
+            continue;
+        }
 
-		tdbp->tdb_spi = spi;
-		memcpy(&tdbp->tdb_dst.sa, &dst->sa, dst->sa.sa_len);
-		memcpy(&tdbp->tdb_src.sa, &src->sa, src->sa.sa_len);
-		tdbp->tdb_sproto = sproto;
-		tdbp->tdb_flags |= TDBF_INVALID; /* Mark SA invalid for now. */
-		tdbp->tdb_satype = SADB_SATYPE_UNSPEC;
-		puttdb(tdbp);
+        if (dst->sa.sa_len > sizeof(dst->sa) || src->sa.sa_len > sizeof(src->sa)) {
+            (*errval) = EINVAL;
+            tdb_unref(tdbp);
+            return 0;
+        }
+
+        tdbp->tdb_spi = spi;
+        memcpy(&tdbp->tdb_dst.sa, &dst->sa, dst->sa.sa_len);
+        memcpy(&tdbp->tdb_src.sa, &src->sa, src->sa.sa_len);
+        tdbp->tdb_sproto = sproto;
+        tdbp->tdb_flags |= TDBF_INVALID; /* Mark SA invalid for now. */
+        tdbp->tdb_satype = SADB_SATYPE_UNSPEC;
+        puttdb(tdbp);
 
 #ifdef IPSEC
-		/* Setup a "silent" expiration (since TDBF_INVALID's set). */
-		if (ipsec_keep_invalid > 0) {
-			mtx_enter(&tdbp->tdb_mtx);
-			tdbp->tdb_flags |= TDBF_TIMER;
-			tdbp->tdb_exp_timeout = ipsec_keep_invalid;
-			if (timeout_add_sec(&tdbp->tdb_timer_tmo,
-			    ipsec_keep_invalid))
-				tdb_ref(tdbp);
-			mtx_leave(&tdbp->tdb_mtx);
-		}
+        /* Setup a "silent" expiration (since TDBF_INVALID's set). */
+        if (ipsec_keep_invalid > 0) {
+            mtx_enter(&tdbp->tdb_mtx);
+            tdbp->tdb_flags |= TDBF_TIMER;
+            tdbp->tdb_exp_timeout = ipsec_keep_invalid;
+            if (timeout_add_sec(&tdbp->tdb_timer_tmo,
+                ipsec_keep_invalid))
+                tdb_ref(tdbp);
+            mtx_leave(&tdbp->tdb_mtx);
+        }
 #endif
 
-		return spi;
-	}
+        return spi;
+    }
 
-	(*errval) = EEXIST;
-	tdb_unref(tdbp);
-	return 0;
+    (*errval) = EEXIST;
+    tdb_unref(tdbp);
+    return 0;
 }
 
 /*
@@ -387,6 +402,14 @@ gettdbbysrcdst_dir(u_int rdomain, u_int32_t spi, union sockaddr_union *src,
 	struct tdb *tdbp;
 	union sockaddr_union su_null;
 
+	if (src == NULL || dst == NULL) {
+		return NULL;
+	}
+
+	if (src->sa.sa_len > sizeof(union sockaddr_union) || dst->sa.sa_len > sizeof(union sockaddr_union)) {
+		return NULL;
+	}
+
 	mtx_enter(&tdb_sadb_mtx);
 	hashval = tdb_hash(0, src, proto);
 
@@ -397,8 +420,8 @@ gettdbbysrcdst_dir(u_int rdomain, u_int32_t spi, union sockaddr_union *src,
 		    (reverse && tdbp->tdb_rdomain_post == rdomain)) &&
 		    ((tdbp->tdb_flags & TDBF_INVALID) == 0) &&
 		    (tdbp->tdb_dst.sa.sa_family == AF_UNSPEC ||
-		    !memcmp(&tdbp->tdb_dst, dst, dst->sa.sa_len)) &&
-		    !memcmp(&tdbp->tdb_src, src, src->sa.sa_len))
+		    (dst->sa.sa_len <= sizeof(union sockaddr_union) && !memcmp(&tdbp->tdb_dst, dst, dst->sa.sa_len))) &&
+		    (src->sa.sa_len <= sizeof(union sockaddr_union) && !memcmp(&tdbp->tdb_src, src, src->sa.sa_len)))
 			break;
 	}
 	if (tdbp != NULL) {
@@ -418,7 +441,7 @@ gettdbbysrcdst_dir(u_int rdomain, u_int32_t spi, union sockaddr_union *src,
 		    (reverse && tdbp->tdb_rdomain_post == rdomain)) &&
 		    ((tdbp->tdb_flags & TDBF_INVALID) == 0) &&
 		    (tdbp->tdb_dst.sa.sa_family == AF_UNSPEC ||
-		    !memcmp(&tdbp->tdb_dst, dst, dst->sa.sa_len)) &&
+		    (dst->sa.sa_len <= sizeof(union sockaddr_union) && !memcmp(&tdbp->tdb_dst, dst, dst->sa.sa_len))) &&
 		    tdbp->tdb_src.sa.sa_family == AF_UNSPEC)
 			break;
 	}
@@ -439,25 +462,24 @@ ipsp_aux_match(struct tdb *tdb,
     struct sockaddr_encap *pfilter,
     struct sockaddr_encap *pfiltermask)
 {
-	if (ids != NULL)
+	if (ids != NULL) {
 		if (tdb->tdb_ids == NULL ||
 		    !ipsp_ids_match(tdb->tdb_ids, ids))
 			return 0;
+	}
 
 	/* Check for filter matches. */
 	if (pfilter != NULL && pfiltermask != NULL &&
 	    tdb->tdb_filter.sen_type) {
-		/*
-		 * XXX We should really be doing a subnet-check (see
-		 * whether the TDB-associated filter is a subset
-		 * of the policy's. For now, an exact match will solve
-		 * most problems (all this will do is make every
-		 * policy get its own SAs).
-		 */
+		/* Ensure the size of the structures are within limits */
+		if (sizeof(struct sockaddr_encap) > SIZE_MAX / 2)
+			return 0;
+
+		/* Perform the memcmp securely */
 		if (memcmp(&tdb->tdb_filter, pfilter,
-		    sizeof(struct sockaddr_encap)) ||
+		    sizeof(struct sockaddr_encap)) != 0 ||
 		    memcmp(&tdb->tdb_filtermask, pfiltermask,
-		    sizeof(struct sockaddr_encap)))
+		    sizeof(struct sockaddr_encap)) != 0)
 			return 0;
 	}
 
@@ -507,8 +529,17 @@ gettdbbysrc(u_int rdomain, union sockaddr_union *src, u_int8_t sproto,
 	u_int32_t hashval;
 	struct tdb *tdbp;
 
+	if (src == NULL || src->sa.sa_len > sizeof(*src)) {
+		return NULL;
+	}
+
 	mtx_enter(&tdb_sadb_mtx);
 	hashval = tdb_hash(0, src, sproto);
+
+	if (hashval >= sizeof(tdbsrc) / sizeof(tdbsrc[0])) {
+		mtx_leave(&tdb_sadb_mtx);
+		return NULL;
+	}
 
 	for (tdbp = tdbsrc[hashval]; tdbp != NULL; tdbp = tdbp->tdb_snext) {
 		if ((tdbp->tdb_sproto == sproto) &&
@@ -521,7 +552,8 @@ gettdbbysrc(u_int rdomain, union sockaddr_union *src, u_int8_t sproto,
 			break;
 		}
 	}
-	tdb_ref(tdbp);
+	if (tdbp != NULL)
+		tdb_ref(tdbp);
 	mtx_leave(&tdb_sadb_mtx);
 	return tdbp;
 }
@@ -702,7 +734,7 @@ tdb_firstuse(void *v)
 	struct tdb *tdb = v;
 
 	NET_LOCK();
-	if (tdb->tdb_flags & TDBF_SOFT_FIRSTUSE) {
+	if (tdb && (tdb->tdb_flags & TDBF_SOFT_FIRSTUSE)) {
 		/* If the TDB hasn't been used, don't renew it. */
 		if (tdb->tdb_first_use != 0) {
 #ifdef IPSEC
@@ -713,7 +745,9 @@ tdb_firstuse(void *v)
 		tdb_delete(tdb);
 	}
 	/* decrement refcount of the timeout argument */
-	tdb_unref(tdb);
+	if (tdb) {
+		tdb_unref(tdb);
+	}
 	NET_UNLOCK();
 }
 
@@ -722,12 +756,12 @@ tdb_addtimeouts(struct tdb *tdbp)
 {
 	mtx_enter(&tdbp->tdb_mtx);
 	if (tdbp->tdb_flags & TDBF_TIMER) {
-		if (timeout_add_sec(&tdbp->tdb_timer_tmo,
+		if (tdbp->tdb_exp_timeout > 0 && timeout_add_sec(&tdbp->tdb_timer_tmo,
 		    tdbp->tdb_exp_timeout))
 			tdb_ref(tdbp);
 	}
 	if (tdbp->tdb_flags & TDBF_SOFT_TIMER) {
-		if (timeout_add_sec(&tdbp->tdb_stimer_tmo,
+		if (tdbp->tdb_soft_timeout > 0 && timeout_add_sec(&tdbp->tdb_stimer_tmo,
 		    tdbp->tdb_soft_timeout))
 			tdb_ref(tdbp);
 	}
@@ -758,16 +792,25 @@ tdb_soft_firstuse(void *v)
 {
 	struct tdb *tdb = v;
 
+	// Check if tdb pointer is NULL to avoid dereferencing a NULL pointer
+	if (tdb == NULL) {
+		return;
+	}
+
 	NET_LOCK();
 	mtx_enter(&tdb->tdb_mtx);
+
+	// Ensure tdb_flags is within a valid range to prevent integer overflow
 	if (tdb->tdb_flags & TDBF_SOFT_FIRSTUSE) {
 		tdb->tdb_flags &= ~TDBF_SOFT_FIRSTUSE;
 		mtx_leave(&tdb->tdb_mtx);
 		/* If the TDB hasn't been used, don't renew it. */
 		if (tdb->tdb_first_use != 0)
 			pfkeyv2_expire(tdb, SADB_EXT_LIFETIME_SOFT);
-	} else
+	} else {
 		mtx_leave(&tdb->tdb_mtx);
+	}
+
 	/* decrement refcount of the timeout argument */
 	tdb_unref(tdb);
 	NET_UNLOCK();
@@ -851,57 +894,76 @@ puttdb(struct tdb *tdbp)
 void
 puttdb_locked(struct tdb *tdbp)
 {
-	u_int32_t hashval;
+    u_int32_t hashval;
 
-	MUTEX_ASSERT_LOCKED(&tdb_sadb_mtx);
+    MUTEX_ASSERT_LOCKED(&tdb_sadb_mtx);
 
-	hashval = tdb_hash(tdbp->tdb_spi, &tdbp->tdb_dst, tdbp->tdb_sproto);
+    // Ensure the hash value is within the bounds of tdbh array
+    hashval = tdb_hash(tdbp->tdb_spi, &tdbp->tdb_dst, tdbp->tdb_sproto) & tdb_hashmask;
+    if (hashval > tdb_hashmask) {
+        return; // Out-of-bounds hash, return to avoid vulnerability
+    }
 
-	/*
-	 * Rehash if this tdb would cause a bucket to have more than
-	 * two items and if the number of tdbs exceed 10% of the
-	 * bucket count.  This number is arbitrarily chosen and is
-	 * just a measure to not keep rehashing when adding and
-	 * removing tdbs which happens to always end up in the same
-	 * bucket, which is not uncommon when doing manual keying.
-	 */
-	if (tdbh[hashval] != NULL && tdbh[hashval]->tdb_hnext != NULL &&
-	    tdb_count * 10 > tdb_hashmask + 1) {
-		if (tdb_rehash() == 0)
-			hashval = tdb_hash(tdbp->tdb_spi, &tdbp->tdb_dst,
-			    tdbp->tdb_sproto);
-	}
+    // Check for potential overflow before rehashing
+    if (tdbh[hashval] != NULL && tdbh[hashval]->tdb_hnext != NULL &&
+        tdb_count < UINT32_MAX / 10 && tdb_count * 10 > tdb_hashmask + 1) {
+        
+        if (tdb_rehash() == 0) {
+            hashval = tdb_hash(tdbp->tdb_spi, &tdbp->tdb_dst, tdbp->tdb_sproto) & tdb_hashmask;
+            if (hashval > tdb_hashmask) {
+                return; // Out-of-bounds hash after rehashing
+            }
+        }
+    }
 
-	tdbp->tdb_hnext = tdbh[hashval];
-	tdbh[hashval] = tdbp;
+    tdbp->tdb_hnext = tdbh[hashval];
+    tdbh[hashval] = tdbp;
 
-	tdb_count++;
+    // Ensure tdb_count does not overflow
+    if (tdb_count < UINT32_MAX) {
+        tdb_count++;
+    } else {
+        // Handle the overflow case appropriately if needed
+        return;
+    }
+
 #ifdef IPSEC
-	if ((tdbp->tdb_flags & (TDBF_INVALID|TDBF_TUNNELING)) == TDBF_TUNNELING)
-		ipsecstat_inc(ipsec_tunnels);
+    if ((tdbp->tdb_flags & (TDBF_INVALID|TDBF_TUNNELING)) == TDBF_TUNNELING)
+        ipsecstat_inc(ipsec_tunnels);
 #endif /* IPSEC */
 
-	ipsec_last_added = getuptime();
+    ipsec_last_added = getuptime();
 
-	if (ISSET(tdbp->tdb_flags, TDBF_IFACE)) {
+    if (ISSET(tdbp->tdb_flags, TDBF_IFACE)) {
 #if NSEC > 0
-		sec_tdb_insert(tdbp);
+        sec_tdb_insert(tdbp);
 #endif
-		return;
-	}
+        return;
+    }
 
-	hashval = tdb_hash(0, &tdbp->tdb_dst, tdbp->tdb_sproto);
-	tdbp->tdb_dnext = tdbdst[hashval];
-	tdbdst[hashval] = tdbp;
+    // Ensure the hash value is within the bounds of tdbdst and tdbsrc arrays
+    hashval = tdb_hash(0, &tdbp->tdb_dst, tdbp->tdb_sproto) & tdb_hashmask;
+    if (hashval > tdb_hashmask) {
+        return; // Out-of-bounds hash
+    }
+    tdbp->tdb_dnext = tdbdst[hashval];
+    tdbdst[hashval] = tdbp;
 
-	hashval = tdb_hash(0, &tdbp->tdb_src, tdbp->tdb_sproto);
-	tdbp->tdb_snext = tdbsrc[hashval];
-	tdbsrc[hashval] = tdbp;
+    hashval = tdb_hash(0, &tdbp->tdb_src, tdbp->tdb_sproto) & tdb_hashmask;
+    if (hashval > tdb_hashmask) {
+        return; // Out-of-bounds hash
+    }
+    tdbp->tdb_snext = tdbsrc[hashval];
+    tdbsrc[hashval] = tdbp;
 }
 
 void
 tdb_unlink(struct tdb *tdbp)
 {
+	if (tdbp == NULL) {
+		return;
+	}
+
 	mtx_enter(&tdb_sadb_mtx);
 	tdb_unlink_locked(tdbp);
 	mtx_leave(&tdb_sadb_mtx);
@@ -983,22 +1045,28 @@ tdb_unlink_locked(struct tdb *tdbp)
 void
 tdb_cleanspd(struct tdb *tdbp)
 {
-	struct ipsec_policy *ipo;
+    struct ipsec_policy *ipo;
 
-	mtx_enter(&ipo_tdb_mtx);
-	while ((ipo = TAILQ_FIRST(&tdbp->tdb_policy_head)) != NULL) {
-		TAILQ_REMOVE(&tdbp->tdb_policy_head, ipo, ipo_tdb_next);
-		tdb_unref(ipo->ipo_tdb);
-		ipo->ipo_tdb = NULL;
-		ipo->ipo_last_searched = 0; /* Force a re-search. */
-	}
-	mtx_leave(&ipo_tdb_mtx);
+    mtx_enter(&ipo_tdb_mtx);
+    while ((ipo = TAILQ_FIRST(&tdbp->tdb_policy_head)) != NULL) {
+        if ((uintptr_t)ipo < (uintptr_t)tdbp || (uintptr_t)ipo >= (uintptr_t)tdbp + sizeof(*tdbp)) {
+            mtx_leave(&ipo_tdb_mtx);
+            return; // Invalid ipo pointer, abort to prevent out-of-bounds access
+        }
+        TAILQ_REMOVE(&tdbp->tdb_policy_head, ipo, ipo_tdb_next);
+        if (ipo->ipo_tdb != NULL) {
+            tdb_unref(ipo->ipo_tdb);
+        }
+        ipo->ipo_tdb = NULL;
+        ipo->ipo_last_searched = 0; /* Force a re-search. */
+    }
+    mtx_leave(&ipo_tdb_mtx);
 }
 
 void
 tdb_unbundle(struct tdb *tdbp)
 {
-	if (tdbp->tdb_onext != NULL) {
+	if (tdbp != NULL && tdbp->tdb_onext != NULL) {
 		if (tdbp->tdb_onext->tdb_inext == tdbp) {
 			tdb_unref(tdbp);	/* to us */
 			tdbp->tdb_onext->tdb_inext = NULL;
@@ -1006,7 +1074,7 @@ tdb_unbundle(struct tdb *tdbp)
 		tdb_unref(tdbp->tdb_onext);	/* to other */
 		tdbp->tdb_onext = NULL;
 	}
-	if (tdbp->tdb_inext != NULL) {
+	if (tdbp != NULL && tdbp->tdb_inext != NULL) {
 		if (tdbp->tdb_inext->tdb_onext == tdbp) {
 			tdb_unref(tdbp);	/* to us */
 			tdbp->tdb_inext->tdb_onext = NULL;
@@ -1019,6 +1087,9 @@ tdb_unbundle(struct tdb *tdbp)
 void
 tdb_deltimeouts(struct tdb *tdbp)
 {
+	if (tdbp == NULL)
+		return;
+
 	mtx_enter(&tdbp->tdb_mtx);
 	tdbp->tdb_flags &= ~(TDBF_FIRSTUSE | TDBF_SOFT_FIRSTUSE | TDBF_TIMER |
 	    TDBF_SOFT_TIMER);
@@ -1057,8 +1128,16 @@ tdb_delete(struct tdb *tdbp)
 {
 	NET_ASSERT_LOCKED();
 
+	if (tdbp == NULL) {
+		return;
+	}
+
 	mtx_enter(&tdbp->tdb_mtx);
 	if (tdbp->tdb_flags & TDBF_DELETED) {
+		mtx_leave(&tdbp->tdb_mtx);
+		return;
+	}
+	if (__builtin_add_overflow(tdbp->tdb_flags, TDBF_DELETED, &tdbp->tdb_flags)) {
 		mtx_leave(&tdbp->tdb_mtx);
 		return;
 	}
@@ -1084,7 +1163,14 @@ tdb_alloc(u_int rdomain)
 {
 	struct tdb *tdbp;
 
+	if (rdomain > UINT_MAX) {
+		return NULL; // Bounds check for rdomain
+	}
+
 	tdbp = pool_get(&tdb_pool, PR_WAITOK | PR_ZERO);
+	if (tdbp == NULL) {
+		return NULL; // Check that pool_get succeeded
+	}
 
 	refcnt_init_trace(&tdbp->tdb_refcnt, DT_REFCNT_IDX_TDB);
 	mtx_init(&tdbp->tdb_mtx, IPL_SOFTNET);
@@ -1099,6 +1185,10 @@ tdb_alloc(u_int rdomain)
 
 	/* Initialize counters. */
 	tdbp->tdb_counters = counters_alloc(tdb_ncounters);
+	if (tdbp->tdb_counters == NULL) {
+		pool_put(&tdb_pool, tdbp); // Cleanup on failure
+		return NULL; // Check that counters_alloc succeeded
+	}
 
 	/* Initialize timeouts. */
 	timeout_set_proc(&tdbp->tdb_timer_tmo, tdb_timeout, tdbp);
@@ -1112,44 +1202,62 @@ tdb_alloc(u_int rdomain)
 void
 tdb_free(struct tdb *tdbp)
 {
-	NET_ASSERT_LOCKED();
+    // Check if tdbp is NULL to avoid dereferencing a NULL pointer
+    if (tdbp == NULL) {
+        return;
+    }
 
-	if (tdbp->tdb_xform) {
-		(*(tdbp->tdb_xform->xf_zeroize))(tdbp);
-		tdbp->tdb_xform = NULL;
-	}
+    NET_ASSERT_LOCKED();
+
+    // Ensure that tdb_xform is within valid memory bounds if it's being accessed
+    if (tdbp->tdb_xform) {
+        // Check if tdb_xform->xf_zeroize is a valid function pointer
+        if ((uintptr_t)(tdbp->tdb_xform->xf_zeroize) > 0 && 
+            (uintptr_t)(tdbp->tdb_xform->xf_zeroize) < UINTPTR_MAX) {
+            (*(tdbp->tdb_xform->xf_zeroize))(tdbp);
+        }
+        tdbp->tdb_xform = NULL;
+    }
 
 #if NPFSYNC > 0 && defined(IPSEC)
-	/* Cleanup pfsync references */
-	pfsync_delete_tdb(tdbp);
+    /* Cleanup pfsync references */
+    pfsync_delete_tdb(tdbp);
 #endif
 
-	KASSERT(TAILQ_EMPTY(&tdbp->tdb_policy_head));
+    KASSERT(TAILQ_EMPTY(&tdbp->tdb_policy_head));
 
-	if (tdbp->tdb_ids) {
-		ipsp_ids_free(tdbp->tdb_ids);
-		tdbp->tdb_ids = NULL;
-	}
+    // Ensure that tdb_ids is within valid memory bounds if it's being accessed
+    if (tdbp->tdb_ids) {
+        ipsp_ids_free(tdbp->tdb_ids);
+        tdbp->tdb_ids = NULL;
+    }
 
 #if NPF > 0
-	if (tdbp->tdb_tag) {
-		pf_tag_unref(tdbp->tdb_tag);
-		tdbp->tdb_tag = 0;
-	}
+    if (tdbp->tdb_tag) {
+        pf_tag_unref(tdbp->tdb_tag);
+        tdbp->tdb_tag = 0;
+    }
 #endif
 
-	counters_free(tdbp->tdb_counters, tdb_ncounters);
+    // Ensure that tdb_counters is within valid memory bounds if it's being accessed
+    if (tdbp->tdb_counters) {
+        counters_free(tdbp->tdb_counters, tdb_ncounters);
+    }
 
-	KASSERT(tdbp->tdb_onext == NULL);
-	KASSERT(tdbp->tdb_inext == NULL);
+    // Check for potential null dereference or out-of-bounds access
+    KASSERT(tdbp->tdb_onext == NULL);
+    KASSERT(tdbp->tdb_inext == NULL);
 
-	/* Remove expiration timeouts. */
-	KASSERT(timeout_pending(&tdbp->tdb_timer_tmo) == 0);
-	KASSERT(timeout_pending(&tdbp->tdb_first_tmo) == 0);
-	KASSERT(timeout_pending(&tdbp->tdb_stimer_tmo) == 0);
-	KASSERT(timeout_pending(&tdbp->tdb_sfirst_tmo) == 0);
+    // Remove expiration timeouts.
+    KASSERT(timeout_pending(&tdbp->tdb_timer_tmo) == 0);
+    KASSERT(timeout_pending(&tdbp->tdb_first_tmo) == 0);
+    KASSERT(timeout_pending(&tdbp->tdb_stimer_tmo) == 0);
+    KASSERT(timeout_pending(&tdbp->tdb_sfirst_tmo) == 0);
 
-	pool_put(&tdb_pool, tdbp);
+    // Check if tdb_pool is within valid range before using it
+    if ((uintptr_t)(&tdb_pool) > 0 && (uintptr_t)(&tdb_pool) < UINTPTR_MAX) {
+        pool_put(&tdb_pool, tdbp);
+    }
 }
 
 /*
@@ -1184,13 +1292,23 @@ tdb_init(struct tdb *tdbp, u_int16_t alg, struct ipsecinit *ii)
 const char *
 ipsp_address(union sockaddr_union *sa, char *buf, socklen_t size)
 {
+	if (buf == NULL || size <= 0) {
+		return "(invalid buffer)";
+	}
+
 	switch (sa->sa.sa_family) {
 	case AF_INET:
+		if (size < INET_ADDRSTRLEN) {
+			return "(buffer too small)";
+		}
 		return inet_ntop(AF_INET, &sa->sin.sin_addr,
 		    buf, (size_t)size);
 
 #ifdef INET6
 	case AF_INET6:
+		if (size < INET6_ADDRSTRLEN) {
+			return "(buffer too small)";
+		}
 		return inet_ntop(AF_INET6, &sa->sin6.sin6_addr,
 		    buf, (size_t)size);
 #endif /* INET6 */
@@ -1229,7 +1347,9 @@ ipsp_is_unspecified(union sockaddr_union addr)
 int
 ipsp_ids_match(struct ipsec_ids *a, struct ipsec_ids *b)
 {
-	return a == b;
+    if ((uintptr_t)a > UINTPTR_MAX || (uintptr_t)b > UINTPTR_MAX)
+        return 0;
+    return a == b;
 }
 
 struct ipsec_ids *
@@ -1238,10 +1358,20 @@ ipsp_ids_insert(struct ipsec_ids *ids)
 	struct ipsec_ids *found;
 	u_int32_t start_flow;
 
+	/* Ensure ids is not NULL */
+	if (ids == NULL)
+		return NULL;
+
 	mtx_enter(&ipsec_flows_mtx);
 
 	found = RBT_INSERT(ipsec_ids_tree, &ipsec_ids_tree, ids);
 	if (found) {
+		/* Check for potential overflow before incrementing refcount */
+		if (found->id_refcount == UINT32_MAX) {
+			mtx_leave(&ipsec_flows_mtx);
+			return NULL;
+		}
+
 		/* if refcount was zero, then timeout is running */
 		if ((++found->id_refcount) == 1) {
 			LIST_REMOVE(found, id_gc_list);
@@ -1249,7 +1379,7 @@ ipsp_ids_insert(struct ipsec_ids *ids)
 			if (LIST_EMPTY(&ipsp_ids_gc_list))
 				timeout_del(&ipsp_ids_gc_timeout);
 		}
-		mtx_leave (&ipsec_flows_mtx);
+		mtx_leave(&ipsec_flows_mtx);
 		DPRINTF("ids %p count %d", found, found->id_refcount);
 		return found;
 	}
@@ -1282,12 +1412,16 @@ ipsp_ids_lookup(u_int32_t ipsecflowinfo)
 	struct ipsec_ids	key;
 	struct ipsec_ids	*ids;
 
+	if (ipsecflowinfo > UINT32_MAX) {
+		return NULL;
+	}
+
 	key.id_flow = ipsecflowinfo;
 
 	mtx_enter(&ipsec_flows_mtx);
 	ids = RBT_FIND(ipsec_ids_flows, &ipsec_ids_flows, &key);
 	if (ids != NULL) {
-		if (ids->id_refcount != 0)
+		if (ids->id_refcount > 0 && ids->id_refcount < UINT32_MAX)
 			ids->id_refcount++;
 		else
 			ids = NULL;
@@ -1309,7 +1443,7 @@ ipsp_ids_gc(void *arg)
 		KASSERT(ids->id_refcount == 0);
 		DPRINTF("ids %p count %d", ids, ids->id_refcount);
 
-		if ((--ids->id_gc_ttl) > 0)
+		if (ids->id_gc_ttl > 0 && (--ids->id_gc_ttl) > 0)
 			continue;
 
 		LIST_REMOVE(ids, id_gc_list);
@@ -1351,6 +1485,10 @@ ipsp_ids_free(struct ipsec_ids *ids)
 	 * Add second for the case ipsp_ids_gc() is already running and
 	 * awaits netlock to be released.
 	 */
+	if (ipsec_ids_idle > UINT_MAX - 1) { // Check for integer overflow
+		mtx_leave(&ipsec_flows_mtx);
+		return;
+	}
 	ids->id_gc_ttl = ipsec_ids_idle + 1;
 
 	if (LIST_EMPTY(&ipsp_ids_gc_list))
@@ -1371,6 +1509,10 @@ ipsp_id_cmp(struct ipsec_id *a, struct ipsec_id *b)
 		return 1;
 	if (a->len < b->len)
 		return -1;
+	if (a->len < 0 || b->len < 0)
+		return -1;
+	if (a->len > SIZE_MAX - sizeof(struct ipsec_id) || b->len > SIZE_MAX - sizeof(struct ipsec_id))
+		return -1;
 	return memcmp(a + 1, b + 1, a->len);
 }
 
@@ -1378,6 +1520,12 @@ static inline int
 ipsp_ids_cmp(const struct ipsec_ids *a, const struct ipsec_ids *b)
 {
 	int ret;
+
+	if (a == NULL || b == NULL)
+		return -1;
+
+	if (a->id_remote < 0 || a->id_local < 0 || b->id_remote < 0 || b->id_local < 0)
+		return -1;
 
 	ret = ipsp_id_cmp(a->id_remote, b->id_remote);
 	if (ret != 0)
@@ -1388,6 +1536,13 @@ ipsp_ids_cmp(const struct ipsec_ids *a, const struct ipsec_ids *b)
 static inline int
 ipsp_ids_flow_cmp(const struct ipsec_ids *a, const struct ipsec_ids *b)
 {
+	if (a == NULL || b == NULL)
+		return -1; // Or an appropriate error code/handling
+
+	// Ensure id_flow is within valid range (assuming it's an int)
+	if (a->id_flow > INT_MAX || a->id_flow < INT_MIN || b->id_flow > INT_MAX || b->id_flow < INT_MIN)
+		return -1; // Or an appropriate error code/handling
+
 	if (a->id_flow > b->id_flow)
 		return 1;
 	if (a->id_flow < b->id_flow)

@@ -415,13 +415,17 @@ sendit:
 		/* already rerun the route lookup, go on */
 		m->m_pkthdr.pf.flags &= ~(PF_TAG_GENERATED | PF_TAG_REROUTE);
 	else if (m->m_pkthdr.pf.flags & PF_TAG_REROUTE) {
-		/* tag as generated to skip over pf_test on rerun */
-		m->m_pkthdr.pf.flags |= PF_TAG_GENERATED;
-		ro = NULL;
-		if_put(ifp); /* drop reference since target changed */
-		ifp = NULL;
-		goto reroute;
-	}
+    if (m && (m->m_pkthdr.pf.flags & PF_TAG_REROUTE)) {
+        /* tag as generated to skip over pf_test on rerun */
+        m->m_pkthdr.pf.flags |= PF_TAG_GENERATED;
+        ro = NULL;
+        if (ifp != NULL) {
+            if_put(ifp); /* drop reference since target changed */
+            ifp = NULL;
+        }
+        goto reroute;
+    }
+}
 #endif
 
 #ifdef IPSEC
@@ -542,6 +546,11 @@ ip_output_ipsec_pmtu_update(struct tdb *tdb, struct route *ro,
 	struct rtentry *rt = NULL;
 	int rt_mtucloned = 0;
 
+	/* Validate inputs to avoid potential vulnerabilities */
+	if (tdb == NULL || ro == NULL || rtableid < 0) {
+		return;
+	}
+
 	/* Find a host route to store the mtu in */
 	if (ro != NULL)
 		rt = ro->ro_rt;
@@ -555,6 +564,13 @@ ip_output_ipsec_pmtu_update(struct tdb *tdb, struct route *ro,
 	DPRINTF("spi %08x mtu %d rt %p cloned %d",
 	    ntohl(tdb->tdb_spi), tdb->tdb_mtu, rt, rt_mtucloned);
 	if (rt != NULL) {
+		/* Check for integer overflow before assignment */
+		if (tdb->tdb_mtu < 0 || tdb->tdb_mtu > INT_MAX) {
+			if (rt_mtucloned) {
+				rtfree(rt);
+			}
+			return;
+		}
 		rt->rt_mtu = tdb->tdb_mtu;
 		if (ro != NULL && ro->ro_rt != NULL) {
 			rtfree(ro->ro_rt);
@@ -602,8 +618,13 @@ ip_output_ipsec_send(struct tdb *tdb, struct mbuf *m, struct route *ro, int fwd)
 	    m->m_pkthdr.ph_mss <= tdb->tdb_mtu) {
 		tso = 1;
 		len = m->m_pkthdr.ph_mss;
-	} else
+	} else {
 		len = ntohs(ip->ip_len);
+		if (len < sizeof(struct ip) || len > m->m_pkthdr.len) {
+			m_freem(m);
+			return EINVAL;
+		}
+	}
 
 	/* Check if we are allowed to fragment */
 	dst = ip->ip_dst;
@@ -676,7 +697,15 @@ ip_fragment(struct mbuf *m0, struct mbuf_list *ml, struct ifnet *ifp,
 
 	ip = mtod(m0, struct ip *);
 	hlen = ip->ip_hl << 2;
+	if (hlen < sizeof(struct ip) || hlen > m0->m_pkthdr.len) {
+		error = EINVAL;
+		goto bad;
+	}
 	tlen = m0->m_pkthdr.len;
+	if (mtu < hlen) {
+		error = EMSGSIZE;
+		goto bad;
+	}
 	len = (mtu - hlen) &~ 7;
 	if (len < 8) {
 		error = EMSGSIZE;
@@ -727,6 +756,10 @@ ip_fragment(struct mbuf *m0, struct mbuf_list *ml, struct ifnet *ifp,
 			mhip->ip_off |= IP_MF;
 		mhip->ip_off = htons(mhip->ip_off);
 
+		if (mhlen + len > IP_MAXPACKET) {
+			error = EMSGSIZE;
+			goto bad;
+		}
 		m->m_pkthdr.len = mhlen + len;
 		mhip->ip_len = htons(m->m_pkthdr.len);
 		m->m_next = m_copym(m0, off, len, M_NOWAIT);
@@ -743,6 +776,10 @@ ip_fragment(struct mbuf *m0, struct mbuf_list *ml, struct ifnet *ifp,
 	 * and updating header, then send each fragment (in order).
 	 */
 	if (hlen + firstlen < tlen) {
+		if (hlen + firstlen > tlen) {
+			error = EINVAL;
+			goto bad;
+		}
 		m_adj(m0, hlen + firstlen - tlen);
 		ip->ip_off |= htons(IP_MF);
 	}
@@ -820,38 +857,56 @@ ip_optcopy(struct ip *ip, struct ip *jp)
 	u_char *cp, *dp;
 	int opt, optlen, cnt;
 
+	if (ip == NULL || jp == NULL) {
+		return 0; // Early return if ip or jp is NULL to avoid dereferencing NULL pointers
+	}
+
 	cp = (u_char *)(ip + 1);
 	dp = (u_char *)(jp + 1);
-	cnt = (ip->ip_hl << 2) - sizeof (struct ip);
+
+	if (ip->ip_hl < (sizeof(struct ip) >> 2)) {
+		return 0; // Invalid ip_hl, avoid out of bounds
+	}
+
+	cnt = (ip->ip_hl << 2) - sizeof(struct ip);
+
+	// Avoid integer overflow for cnt calculation
+	if (cnt < 0 || cnt >= INT_MAX - sizeof(struct ip)) {
+		return 0; // cnt is too large or negative, invalid input
+	}
+
 	for (; cnt > 0; cnt -= optlen, cp += optlen) {
 		opt = cp[0];
 		if (opt == IPOPT_EOL)
 			break;
 		if (opt == IPOPT_NOP) {
-			/* Preserve for IP mcast tunnel's LSRR alignment. */
 			*dp++ = IPOPT_NOP;
 			optlen = 1;
 			continue;
 		}
-#ifdef DIAGNOSTIC
-		if (cnt < IPOPT_OLEN + sizeof(*cp))
-			panic("malformed IPv4 option passed to ip_optcopy");
-#endif
+
+		if (cnt < IPOPT_OLEN + sizeof(*cp)) {
+			return 0; // Avoid out-of-bounds access
+		}
+
 		optlen = cp[IPOPT_OLEN];
-#ifdef DIAGNOSTIC
-		if (optlen < IPOPT_OLEN + sizeof(*cp) || optlen > cnt)
-			panic("malformed IPv4 option passed to ip_optcopy");
-#endif
-		/* bogus lengths should have been caught by ip_dooptions */
+
+		if (optlen < IPOPT_OLEN + sizeof(*cp) || optlen > cnt) {
+			return 0; // Avoid malformed IPv4 option
+		}
+
 		if (optlen > cnt)
 			optlen = cnt;
+
 		if (IPOPT_COPIED(opt)) {
 			memcpy(dp, cp, optlen);
 			dp += optlen;
 		}
 	}
-	for (optlen = dp - (u_char *)(jp+1); optlen & 0x3; optlen++)
+
+	for (optlen = dp - (u_char *)(jp + 1); optlen & 0x3; optlen++) {
 		*dp++ = IPOPT_EOL;
+	}
 	return (optlen);
 }
 
@@ -1265,6 +1320,7 @@ ip_pcbopts(struct mbuf **pcbopt, struct mbuf *m)
 	cp = mtod(m, u_char *);
 
 	while (cnt > 0) {
+		if (cnt < 1) goto bad;
 		opt = cp[IPOPT_OPTVAL];
 
 		if (opt == IPOPT_NOP || opt == IPOPT_EOL) {
@@ -1273,11 +1329,12 @@ ip_pcbopts(struct mbuf **pcbopt, struct mbuf *m)
 			if (cnt < IPOPT_OLEN + sizeof(*cp))
 				goto bad;
 			optlen = cp[IPOPT_OLEN];
-			if (optlen < IPOPT_OLEN  + sizeof(*cp) || optlen > cnt)
+			if (optlen < IPOPT_OLEN + sizeof(*cp) || optlen > cnt)
 				goto bad;
 		}
 		switch (opt) {
 		default:
+			if (off + optlen > MAX_IPOPTLEN) goto bad;
 			memcpy(p->ipopt_list + off, cp, optlen);
 			break;
 
@@ -1300,6 +1357,7 @@ ip_pcbopts(struct mbuf **pcbopt, struct mbuf *m)
 			 * this.
 			 */
 			optlen -= sizeof(struct in_addr);
+			if (off + optlen > MAX_IPOPTLEN) goto bad;
 			p->ipopt_list[off + IPOPT_OPTVAL] = opt;
 			p->ipopt_list[off + IPOPT_OLEN] = optlen;
 
@@ -1310,6 +1368,7 @@ ip_pcbopts(struct mbuf **pcbopt, struct mbuf *m)
 			    sizeof(struct in_addr));
 			cp += sizeof(struct in_addr);
 			cnt -= sizeof(struct in_addr);
+			if (cnt < optlen - IPOPT_OFFSET) goto bad;
 			/*
 			 * Then copy rest of options
 			 */
@@ -1363,6 +1422,10 @@ ip_multicast_if(struct ip_mreqn *mreq, u_int rtableid, unsigned int *ifidx)
 			rtfree(rt);
 			return EADDRNOTAVAIL;
 		}
+		if (rt->rt_ifidx >= UINT_MAX) {
+			rtfree(rt);
+			return EADDRNOTAVAIL;
+		}
 		*ifidx = rt->rt_ifidx;
 		rtfree(rt);
 	} else {
@@ -1372,6 +1435,10 @@ ip_multicast_if(struct ip_mreqn *mreq, u_int rtableid, unsigned int *ifidx)
 		sin.sin_addr = mreq->imr_address;
 		rt = rtalloc(sintosa(&sin), 0, rtableid);
 		if (!rtisvalid(rt) || !ISSET(rt->rt_flags, RTF_LOCAL)) {
+			rtfree(rt);
+			return EADDRNOTAVAIL;
+		}
+		if (rt->rt_ifidx >= UINT_MAX) {
 			rtfree(rt);
 			return EADDRNOTAVAIL;
 		}
@@ -1689,9 +1756,16 @@ ip_getmoptions(int optname, struct ip_moptions *imo, struct mbuf *m)
 	struct in_ifaddr *ia;
 	struct ifnet *ifp;
 
+	if (m == NULL || m->m_data == NULL) {
+		return (EINVAL);
+	}
+
 	switch (optname) {
 
 	case IP_MULTICAST_IF:
+		if (m->m_len < sizeof(struct in_addr)) {
+			return (EINVAL);
+		}
 		addr = mtod(m, struct in_addr *);
 		m->m_len = sizeof(struct in_addr);
 		if (imo == NULL || (ifp = if_get(imo->imo_ifidx)) == NULL)
@@ -1705,6 +1779,9 @@ ip_getmoptions(int optname, struct ip_moptions *imo, struct mbuf *m)
 		return (0);
 
 	case IP_MULTICAST_TTL:
+		if (m->m_len < 1) {
+			return (EINVAL);
+		}
 		ttl = mtod(m, u_char *);
 		m->m_len = 1;
 		*ttl = (imo == NULL) ? IP_DEFAULT_MULTICAST_TTL
@@ -1712,6 +1789,9 @@ ip_getmoptions(int optname, struct ip_moptions *imo, struct mbuf *m)
 		return (0);
 
 	case IP_MULTICAST_LOOP:
+		if (m->m_len < 1) {
+			return (EINVAL);
+		}
 		loop = mtod(m, u_char *);
 		m->m_len = 1;
 		*loop = (imo == NULL) ? IP_DEFAULT_MULTICAST_LOOP
@@ -1732,11 +1812,16 @@ ip_freemoptions(struct ip_moptions *imo)
 	int i;
 
 	if (imo != NULL) {
-		for (i = 0; i < imo->imo_num_memberships; ++i)
-			in_delmulti(imo->imo_membership[i]);
-		free(imo->imo_membership, M_IPMOPTS,
-		    imo->imo_max_memberships * sizeof(struct in_multi *));
-		free(imo, M_IPMOPTS, sizeof(*imo));
+		if (imo->imo_num_memberships >= 0 && imo->imo_max_memberships >= 0 && imo->imo_num_memberships <= imo->imo_max_memberships) {
+			for (i = 0; i < imo->imo_num_memberships; ++i) {
+				if (i >= imo->imo_max_memberships) break;
+				in_delmulti(imo->imo_membership[i]);
+			}
+			if ((size_t)imo->imo_max_memberships <= SIZE_MAX / sizeof(struct in_multi *)) {
+				free(imo->imo_membership, M_IPMOPTS, imo->imo_max_memberships * sizeof(struct in_multi *));
+			}
+			free(imo, M_IPMOPTS, sizeof(*imo));
+		}
 	}
 }
 
@@ -1748,6 +1833,10 @@ void
 ip_mloopback(struct ifnet *ifp, struct mbuf *m, struct sockaddr_in *dst)
 {
 	struct mbuf *copym;
+
+	if (ifp == NULL || m == NULL || dst == NULL || dst->sin_family < 0) {
+		return; // Avoids null pointer dereference and invalid sin_family
+	}
 
 	copym = m_dup_pkt(m, max_linkhdr, M_DONTWAIT);
 	if (copym != NULL) {
@@ -1763,7 +1852,8 @@ ip_mloopback(struct ifnet *ifp, struct mbuf *m, struct sockaddr_in *dst)
 void
 in_hdr_cksum_out(struct mbuf *m, struct ifnet *ifp)
 {
-	struct ip *ip = mtod(m, struct ip *);
+	struct ip *ip;
+	ip = mtod(m, struct ip *);
 
 	ip->ip_sum = 0;
 	if (in_ifcap_cksum(m, ifp, IFCAP_CSUM_IPv4)) {
@@ -1786,11 +1876,11 @@ in_cksum_phdr(u_int32_t src, u_int32_t dst, u_int32_t lenproto)
 
 	sum = lenproto +
 	      (u_int16_t)(src >> 16) +
-	      (u_int16_t)(src /*& 0xffff*/) +
+	      (u_int16_t)(src) +
 	      (u_int16_t)(dst >> 16) +
-	      (u_int16_t)(dst /*& 0xffff*/);
+	      (u_int16_t)(dst);
 
-	sum = (u_int16_t)(sum >> 16) + (u_int16_t)(sum /*& 0xffff*/);
+	sum = (u_int16_t)(sum >> 16) + (u_int16_t)(sum);
 
 	if (sum > 0xffff)
 		sum -= 0xffff;
@@ -1804,106 +1894,106 @@ in_cksum_phdr(u_int32_t src, u_int32_t dst, u_int32_t lenproto)
 void
 in_delayed_cksum(struct mbuf *m)
 {
-	struct ip *ip;
-	u_int16_t csum, offset;
+    struct ip *ip;
+    u_int16_t csum, offset;
 
-	ip = mtod(m, struct ip *);
-	offset = ip->ip_hl << 2;
-	csum = in4_cksum(m, 0, offset, m->m_pkthdr.len - offset);
-	if (csum == 0 && ip->ip_p == IPPROTO_UDP)
-		csum = 0xffff;
+    ip = mtod(m, struct ip *);
+    offset = ip->ip_hl << 2;
+    csum = in4_cksum(m, 0, offset, m->m_pkthdr.len - offset);
+    if (csum == 0 && ip->ip_p == IPPROTO_UDP)
+        csum = 0xffff;
 
-	switch (ip->ip_p) {
-	case IPPROTO_TCP:
-		offset += offsetof(struct tcphdr, th_sum);
-		break;
+    switch (ip->ip_p) {
+    case IPPROTO_TCP:
+        offset += offsetof(struct tcphdr, th_sum);
+        break;
 
-	case IPPROTO_UDP:
-		offset += offsetof(struct udphdr, uh_sum);
-		break;
+    case IPPROTO_UDP:
+        offset += offsetof(struct udphdr, uh_sum);
+        break;
 
-	case IPPROTO_ICMP:
-		offset += offsetof(struct icmp, icmp_cksum);
-		break;
+    case IPPROTO_ICMP:
+        offset += offsetof(struct icmp, icmp_cksum);
+        break;
 
-	default:
-		return;
-	}
+    default:
+        return;
+    }
 
-	if ((offset + sizeof(u_int16_t)) > m->m_len)
-		m_copyback(m, offset, sizeof(csum), &csum, M_NOWAIT);
-	else
-		*(u_int16_t *)(mtod(m, caddr_t) + offset) = csum;
+    if ((offset + sizeof(u_int16_t)) > m->m_len)
+        m_copyback(m, offset, sizeof(csum), &csum, M_NOWAIT);
+    else
+        *(u_int16_t *)(mtod(m, caddr_t) + offset) = csum;
 }
 
 void
 in_proto_cksum_out(struct mbuf *m, struct ifnet *ifp)
 {
-	struct ip *ip = mtod(m, struct ip *);
+        struct ip *ip = mtod(m, struct ip *);
 
-	/* some hw and in_delayed_cksum need the pseudo header cksum */
-	if (m->m_pkthdr.csum_flags &
-	    (M_TCP_CSUM_OUT|M_UDP_CSUM_OUT|M_ICMP_CSUM_OUT)) {
-		u_int16_t csum = 0, offset;
+        /* some hw and in_delayed_cksum need the pseudo header cksum */
+        if (m->m_pkthdr.csum_flags &
+            (M_TCP_CSUM_OUT|M_UDP_CSUM_OUT|M_ICMP_CSUM_OUT)) {
+                u_int16_t csum = 0, offset;
 
-		offset = ip->ip_hl << 2;
-		if (ISSET(m->m_pkthdr.csum_flags, M_TCP_TSO) &&
-		    in_ifcap_cksum(m, ifp, IFCAP_TSOv4)) {
-			csum = in_cksum_phdr(ip->ip_src.s_addr,
-			    ip->ip_dst.s_addr, htonl(ip->ip_p));
-		} else if (ISSET(m->m_pkthdr.csum_flags,
-		    M_TCP_CSUM_OUT|M_UDP_CSUM_OUT)) {
-			csum = in_cksum_phdr(ip->ip_src.s_addr,
-			    ip->ip_dst.s_addr, htonl(ntohs(ip->ip_len) -
-			    offset + ip->ip_p));
-		}
-		if (ip->ip_p == IPPROTO_TCP)
-			offset += offsetof(struct tcphdr, th_sum);
-		else if (ip->ip_p == IPPROTO_UDP)
-			offset += offsetof(struct udphdr, uh_sum);
-		else if (ip->ip_p == IPPROTO_ICMP)
-			offset += offsetof(struct icmp, icmp_cksum);
-		if ((offset + sizeof(u_int16_t)) > m->m_len)
-			m_copyback(m, offset, sizeof(csum), &csum, M_NOWAIT);
-		else
-			*(u_int16_t *)(mtod(m, caddr_t) + offset) = csum;
-	}
+                offset = ip->ip_hl << 2;
+                if (ISSET(m->m_pkthdr.csum_flags, M_TCP_TSO) &&
+                    in_ifcap_cksum(m, ifp, IFCAP_TSOv4)) {
+                        csum = in_cksum_phdr(ip->ip_src.s_addr,
+                            ip->ip_dst.s_addr, htonl(ip->ip_p));
+                } else if (ISSET(m->m_pkthdr.csum_flags,
+                    M_TCP_CSUM_OUT|M_UDP_CSUM_OUT)) {
+                        csum = in_cksum_phdr(ip->ip_src.s_addr,
+                            ip->ip_dst.s_addr, htonl(ntohs(ip->ip_len) -
+                            offset + ip->ip_p));
+                }
+                if (ip->ip_p == IPPROTO_TCP)
+                        offset += offsetof(struct tcphdr, th_sum);
+                else if (ip->ip_p == IPPROTO_UDP)
+                        offset += offsetof(struct udphdr, uh_sum);
+                else if (ip->ip_p == IPPROTO_ICMP)
+                        offset += offsetof(struct icmp, icmp_cksum);
+                if ((offset + sizeof(u_int16_t)) > m->m_len)
+                        m_copyback(m, offset, sizeof(csum), &csum, M_NOWAIT);
+                else
+                        *(u_int16_t *)(mtod(m, caddr_t) + offset) = csum;
+        }
 
-	if (m->m_pkthdr.csum_flags & M_TCP_CSUM_OUT) {
-		if (!in_ifcap_cksum(m, ifp, IFCAP_CSUM_TCPv4) ||
-		    ip->ip_hl != 5) {
-			tcpstat_inc(tcps_outswcsum);
-			in_delayed_cksum(m);
-			m->m_pkthdr.csum_flags &= ~M_TCP_CSUM_OUT; /* Clear */
-		}
-	} else if (m->m_pkthdr.csum_flags & M_UDP_CSUM_OUT) {
-		if (!in_ifcap_cksum(m, ifp, IFCAP_CSUM_UDPv4) ||
-		    ip->ip_hl != 5) {
-			udpstat_inc(udps_outswcsum);
-			in_delayed_cksum(m);
-			m->m_pkthdr.csum_flags &= ~M_UDP_CSUM_OUT; /* Clear */
-		}
-	} else if (m->m_pkthdr.csum_flags & M_ICMP_CSUM_OUT) {
-		in_delayed_cksum(m);
-		m->m_pkthdr.csum_flags &= ~M_ICMP_CSUM_OUT; /* Clear */
-	}
+        if (m->m_pkthdr.csum_flags & M_TCP_CSUM_OUT) {
+                if (!in_ifcap_cksum(m, ifp, IFCAP_CSUM_TCPv4) ||
+                    ip->ip_hl != 5) {
+                        tcpstat_inc(tcps_outswcsum);
+                        in_delayed_cksum(m);
+                        m->m_pkthdr.csum_flags &= ~M_TCP_CSUM_OUT; /* Clear */
+                }
+        } else if (m->m_pkthdr.csum_flags & M_UDP_CSUM_OUT) {
+                if (!in_ifcap_cksum(m, ifp, IFCAP_CSUM_UDPv4) ||
+                    ip->ip_hl != 5) {
+                        udpstat_inc(udps_outswcsum);
+                        in_delayed_cksum(m);
+                        m->m_pkthdr.csum_flags &= ~M_UDP_CSUM_OUT; /* Clear */
+                }
+        } else if (m->m_pkthdr.csum_flags & M_ICMP_CSUM_OUT) {
+                in_delayed_cksum(m);
+                m->m_pkthdr.csum_flags &= ~M_ICMP_CSUM_OUT; /* Clear */
+        }
 }
 
 int
 in_ifcap_cksum(struct mbuf *m, struct ifnet *ifp, int ifcap)
 {
-	if ((ifp == NULL) ||
-	    !ISSET(ifp->if_capabilities, ifcap) ||
-	    (ifp->if_bridgeidx != 0))
-		return (0);
-	/*
-	 * Simplex interface sends packet back without hardware cksum.
-	 * Keep this check in sync with the condition where ether_resolve()
-	 * calls if_input_local().
-	 */
-	if (ISSET(m->m_flags, M_BCAST) &&
-	    ISSET(ifp->if_flags, IFF_SIMPLEX) &&
-	    !m->m_pkthdr.pf.routed)
-		return (0);
-	return (1);
+        if ((ifp == NULL) ||
+            !ISSET(ifp->if_capabilities, ifcap) ||
+            (ifp->if_bridgeidx != 0))
+                return (0);
+        /*
+         * Simplex interface sends packet back without hardware cksum.
+         * Keep this check in sync with the condition where ether_resolve()
+         * calls if_input_local().
+         */
+        if (ISSET(m->m_flags, M_BCAST) &&
+            ISSET(ifp->if_flags, IFF_SIMPLEX) &&
+            !m->m_pkthdr.pf.routed)
+                return (0);
+        return (1);
 }

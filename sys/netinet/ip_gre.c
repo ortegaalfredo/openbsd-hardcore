@@ -83,6 +83,14 @@ gre_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 #ifdef  PIPEX 
 	struct inpcb *inp = sotoinpcb(so);
 
+	// Validate inp before dereferencing
+	if (inp == NULL) {
+		m_freem(m);
+		m_freem(nam);
+		m_freem(control);
+		return (EINVAL);
+	}
+
 	if (inp->inp_pipex) {
 		struct sockaddr_in *sin4;
 		const struct in_addr *ina_dst;
@@ -91,9 +99,14 @@ gre_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 		if ((so->so_state & SS_ISCONNECTED) != 0)
 			ina_dst = &inp->inp_laddr;
 		else if (nam) {
-			if (in_nam2sin(nam, &sin4) == 0)
-				ina_dst = &sin4->sin_addr;
-		}
+    if (in_nam2sin(nam, &sin4) == 0) {
+        if (sin4 != NULL && nam != NULL) { // Ensure sin4 and nam are not NULL
+            ina_dst = &sin4->sin_addr;
+        }
+    }
+}
+
+		// Validate ina_dst before proceeding
 		if (ina_dst != NULL) {
 			struct pipex_session *session;
 

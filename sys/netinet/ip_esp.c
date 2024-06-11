@@ -86,7 +86,10 @@
 int
 esp_attach(void)
 {
-	return 0;
+    if (sizeof(int) > sizeof(void *)) {
+        return -1; // Indicate an error to avoid potential integer overflow
+    }
+    return 0;
 }
 
 /*
@@ -1001,6 +1004,10 @@ checkreplaywindow(struct tdb *tdb, u_int64_t t, u_int32_t seq, u_int32_t *seqh,
 	/* Current replay window starts here */
 	wl = tl - window + 1;
 
+	// Check for potential out-of-bounds index
+	if (seq >= TDB_REPLAYMAX) 
+		return (2);
+
 	idx = (seq % TDB_REPLAYMAX) / 32;
 	packet = 1U << (31 - (seq & 31));
 
@@ -1015,9 +1022,9 @@ checkreplaywindow(struct tdb *tdb, u_int64_t t, u_int32_t seq, u_int32_t *seqh,
 		*seqh = th;
 		if (seq > tl) {
 			if (commit) {
-				if (seq - tl > window)
-					memset(tdb->tdb_seen, 0,
-					    sizeof(tdb->tdb_seen));
+				// Ensure no integer underflow
+				if (seq > tl && seq - tl > window) 
+					memset(tdb->tdb_seen, 0, sizeof(tdb->tdb_seen));
 				else {
 					int i = (tl % TDB_REPLAYMAX) / 32;
 
@@ -1030,7 +1037,8 @@ checkreplaywindow(struct tdb *tdb, u_int64_t t, u_int32_t seq, u_int32_t *seqh,
 				tdb->tdb_rpl = ((u_int64_t)*seqh << 32) | seq;
 			}
 		} else {
-			if (tl - seq >= window)
+			// Ensure no integer underflow
+			if (tl >= seq && tl - seq >= window)
 				return (2);
 			if (tdb->tdb_seen[idx] & packet)
 				return (3);
@@ -1067,7 +1075,8 @@ checkreplaywindow(struct tdb *tdb, u_int64_t t, u_int32_t seq, u_int32_t *seqh,
 	if (*seqh == 0)		/* Don't let high bit to wrap */
 		return (1);
 	if (commit) {
-		if (seq - tl > window)
+		// Ensure no integer underflow
+		if (seq > tl && seq - tl > window)
 			memset(tdb->tdb_seen, 0, sizeof(tdb->tdb_seen));
 		else {
 			int i = (tl % TDB_REPLAYMAX) / 32;

@@ -141,11 +141,22 @@ int icmp_sysctl_icmpstat(void *, size_t *, void *);
 void
 icmp_init(void)
 {
+	if (icps_ncounters < 0 || icps_ncounters > INT_MAX / sizeof(*icmpcounters)) {
+		// Handle error appropriately, possibly with return or exit
+		return;
+	}
+
 	rt_timer_queue_init(&ip_mtudisc_timeout_q, ip_mtudisc_timeout,
 	    &icmp_mtudisc_timeout);
 	rt_timer_queue_init(&icmp_redirect_timeout_q, icmp_redirtimeout,
 	    NULL);
+
 	icmpcounters = counters_alloc(icps_ncounters);
+
+	if (icmpcounters == NULL) {
+		// Handle allocation failure appropriately, possibly with return or exit
+		return;
+	}
 }
 
 struct mbuf *
@@ -293,6 +304,9 @@ freeit:
 void
 icmp_error(struct mbuf *n, int type, int code, u_int32_t dest, int destmtu)
 {
+	if (n == NULL || type < 0 || type > 255 || code < 0 || code > 255) {
+		return;
+	}
 	struct mbuf *m;
 
 	m = icmp_do_error(n, type, code, dest, destmtu);
@@ -309,8 +323,18 @@ icmp_input(struct mbuf **mp, int *offp, int proto, int af)
 {
 	struct ifnet *ifp;
 
+	if (mp == NULL || *mp == NULL || offp == NULL) {
+		return IPPROTO_DONE;
+	}
+
 	ifp = if_get((*mp)->m_pkthdr.ph_ifidx);
 	if (ifp == NULL) {
+		m_freemp(mp);
+		return IPPROTO_DONE;
+	}
+
+	if (*offp < 0 || *offp >= (*mp)->m_pkthdr.len) {
+		if_put(ifp);
 		m_freemp(mp);
 		return IPPROTO_DONE;
 	}
@@ -342,8 +366,16 @@ icmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 	if (icmpprintfs) {
 		char dst[INET_ADDRSTRLEN], src[INET_ADDRSTRLEN];
 
-		inet_ntop(AF_INET, &ip->ip_dst, dst, sizeof(dst));
-		inet_ntop(AF_INET, &ip->ip_src, src, sizeof(src));
+		if (inet_ntop(AF_INET, &ip->ip_dst, dst, sizeof(dst)) == NULL ||
+		    inet_ntop(AF_INET, &ip->ip_src, src, sizeof(src)) == NULL) {
+			// Handle error, return or continue as appropriate
+			return;
+		}
+
+		if (icmplen < 0 || icmplen > MAX_ICMP_LEN) {
+			// Handle error, return or continue as appropriate
+			return;
+		}
 
 		printf("icmp_input from %s to %s, len %d\n", src, dst, icmplen);
 	}
@@ -827,10 +859,19 @@ void
 icmp_send(struct mbuf *m, struct mbuf *opts)
 {
 	struct ip *ip = mtod(m, struct ip *);
-	int hlen;
+	int hlen, mlen;
 	struct icmp *icp;
 
+	if (ip == NULL) return; // Check if IP header is valid
+
 	hlen = ip->ip_hl << 2;
+	if (hlen < sizeof(struct ip) || hlen > m->m_len)
+		return; // Check IP header length to avoid out-of-bounds
+
+	mlen = m->m_len - hlen;
+	if (mlen < sizeof(struct icmp))
+		return; // Check if there's enough space for ICMP header
+
 	icp = (struct icmp *)(mtod(m, caddr_t) + hlen);
 	icp->icmp_cksum = 0;
 	m->m_pkthdr.csum_flags = M_ICMP_CSUM_OUT;
@@ -838,8 +879,15 @@ icmp_send(struct mbuf *m, struct mbuf *opts)
 	if (icmpprintfs) {
 		char dst[INET_ADDRSTRLEN], src[INET_ADDRSTRLEN];
 
-		inet_ntop(AF_INET, &ip->ip_dst, dst, sizeof(dst));
-		inet_ntop(AF_INET, &ip->ip_src, src, sizeof(src));
+		if (inet_ntop(AF_INET, &ip->ip_dst, dst, sizeof(dst)) == NULL) {
+			perror("inet_ntop error");
+			return;
+		}
+
+		if (inet_ntop(AF_INET, &ip->ip_src, src, sizeof(src)) == NULL) {
+			perror("inet_ntop error");
+			return;
+		}
 
 		printf("icmp_send dst %s src %s\n", dst, src);
 	}
@@ -851,6 +899,8 @@ icmp_send(struct mbuf *m, struct mbuf *opts)
 	if (opts != NULL) {
 		m = ip_insertoptions(m, opts, &hlen);
 		ip = mtod(m, struct ip *);
+		if (ip == NULL) return; // Check if IP header is valid after option insertion
+		
 		ip->ip_hl = (hlen >> 2);
 		ip->ip_v = IPVERSION;
 		ip->ip_off &= htons(IP_DF);
@@ -864,12 +914,26 @@ icmp_send(struct mbuf *m, struct mbuf *opts)
 u_int32_t
 iptime(void)
 {
-	struct timeval atv;
-	u_long t;
+    struct timeval atv;
+    u_long t;
 
-	microtime(&atv);
-	t = (atv.tv_sec % (24*60*60)) * 1000 + atv.tv_usec / 1000;
-	return (htonl(t));
+    microtime(&atv);
+
+    if (atv.tv_sec < 0 || atv.tv_sec >= (24*60*60)) {
+        atv.tv_sec = 0;
+    }
+
+    if (atv.tv_usec < 0 || atv.tv_usec >= 1000000) {
+        atv.tv_usec = 0;
+    }
+
+    t = (u_long)atv.tv_sec * 1000 + atv.tv_usec / 1000;
+
+    if (t > UINT32_MAX) {
+        t = UINT32_MAX;
+    }
+
+    return (htonl(t));
 }
 
 int
@@ -881,6 +945,10 @@ icmp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
+
+	/* Ensure 'name' is not NULL and contains at least one element to access name[0] */
+	if (name == NULL || namelen < 1)
+		return (EINVAL);
 
 	switch (name[0]) {
 	case ICMPCTL_REDIRTIMEOUT:
@@ -919,8 +987,17 @@ icmp_sysctl_icmpstat(void *oldp, size_t *oldlenp, void *newp)
 	memset(&icmpstat, 0, sizeof icmpstat);
 	counters_read(icmpcounters, counters, nitems(counters), NULL);
 
-	for (i = 0; i < nitems(counters); i++)
-		words[i] = (u_long)counters[i];
+	// Ensure the number of items does not exceed the size of icmpstat
+	if (nitems(counters) > sizeof(icmpstat) / sizeof(u_long)) {
+	    return -1; // or appropriate error code
+	}
+
+	for (i = 0; i < nitems(counters); i++) {
+	    if (counters[i] > ULONG_MAX) {
+	        return -1; // or appropriate error code
+	    }
+	    words[i] = (u_long)counters[i];
+	}
 
 	return (sysctl_rdstruct(oldp, oldlenp, newp,
 	    &icmpstat, sizeof(icmpstat)));
@@ -932,6 +1009,11 @@ icmp_mtudisc_clone(struct in_addr dst, u_int rtableid, int ipsec)
 	struct sockaddr_in sin;
 	struct rtentry *rt;
 	int error;
+
+	if (rtableid > UINT_MAX)
+		return NULL;
+	if (ipsec > INT_MAX || ipsec < INT_MIN)
+		return NULL;
 
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
@@ -1000,6 +1082,13 @@ icmp_mtudisc(struct icmp *icp, u_int rtableid)
 	struct rtentry *rt;
 	struct ifnet *ifp;
 	u_long mtu = ntohs(icp->icmp_nextmtu);  /* Why a long?  IPv6 */
+	u_long ip_len = ntohs(icp->icmp_ip.ip_len);
+	u_int ip_hl = icp->icmp_ip.ip_hl;
+
+	/* Check for potential overflow or invalid data */
+	if (mtu > UINT_MAX || ip_len > UINT_MAX || ip_hl > UINT_MAX) {
+		return;
+	}
 
 	rt = icmp_mtudisc_clone(icp->icmp_ip.ip_dst, rtableid, 0);
 	if (rt == NULL)
@@ -1014,17 +1103,21 @@ icmp_mtudisc(struct icmp *icp, u_int rtableid)
 	if (mtu == 0) {
 		int i = 0;
 
-		mtu = ntohs(icp->icmp_ip.ip_len);
+		mtu = ip_len;
 		/* Some 4.2BSD-based routers incorrectly adjust the ip_len */
-		if (mtu > rt->rt_mtu && rt->rt_mtu != 0)
-			mtu -= (icp->icmp_ip.ip_hl << 2);
+		if (mtu > rt->rt_mtu && rt->rt_mtu != 0) {
+			if (ip_hl < 16) { /* ip_hl is 4 bits, so max valid value is 15 */
+				mtu -= (ip_hl << 2);
+			} else {
+				mtu = 0; /* Invalid ip_hl value, reset mtu */
+			}
+		}
 
 		/* If we still can't guess a value, try the route */
 		if (mtu == 0) {
 			mtu = rt->rt_mtu;
 
 			/* If no route mtu, default to the interface mtu */
-
 			if (mtu == 0)
 				mtu = ifp->if_mtu;
 		}
@@ -1118,23 +1211,40 @@ icmp_do_exthdr(struct mbuf *m, u_int16_t class, u_int8_t ctype, void *buf,
 		struct icmp_ext_obj_hdr	ieo;
 	} hdr;
 
+	// Check mbuf size to avoid out-of-bounds access
+	if (m->m_len < sizeof(struct ip))
+		return (0);
+
 	hlen = ip->ip_hl << 2;
+	if (m->m_len < hlen + sizeof(struct icmp))
+		return (0);
+
 	icp = (struct icmp *)(mtod(m, caddr_t) + hlen);
-	if (icp->icmp_type != ICMP_TIMXCEED && icp->icmp_type != ICMP_UNREACH &&
+	if (icp->icmp_type != ICMP_TIMXCEED && 
+	    icp->icmp_type != ICMP_UNREACH && 
 	    icp->icmp_type != ICMP_PARAMPROB)
-		/* exthdr not supported */
 		return (0);
 
 	if (icp->icmp_length != 0)
-		/* exthdr already present, giving up */
 		return (0);
 
-	/* the actual offset starts after the common ICMP header */
 	hlen += ICMP_MINLEN;
-	/* exthdr must start on a word boundary */
+
+	// Check for potential integer overflow with ntohs(ip->ip_len)
+	if (ntohs(ip->ip_len) < hlen)
+		return (0);
+
+	// Ensure ip_len does not lead to out-of-bounds access
+	if (m->m_pkthdr.len < ntohs(ip->ip_len))
+		return (0);
+
 	off = roundup(ntohs(ip->ip_len) - hlen, sizeof(u_int32_t));
-	/* ... and at an offset of ICMP_EXT_OFFSET or bigger */
 	off = max(off, ICMP_EXT_OFFSET);
+
+	// Check for integer overflow in multiplication
+	if (off / sizeof(u_int32_t) > UINT8_MAX)
+		return (0);
+
 	icp->icmp_length = off / sizeof(u_int32_t);
 
 	memset(&hdr, 0, sizeof(hdr));
@@ -1143,16 +1253,27 @@ icmp_do_exthdr(struct mbuf *m, u_int16_t class, u_int8_t ctype, void *buf,
 	hdr.ieo.ieo_cnum = class;
 	hdr.ieo.ieo_ctype = ctype;
 
+	// Check for potential integer overflow in m_copyback parameters
+	if (hlen + off > INT_MAX - sizeof(hdr) || 
+	    hlen + off + sizeof(hdr) > INT_MAX - len) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+
 	if (m_copyback(m, hlen + off, sizeof(hdr), &hdr, M_NOWAIT) ||
 	    m_copyback(m, hlen + off + sizeof(hdr), len, buf, M_NOWAIT)) {
 		m_freem(m);
 		return (ENOBUFS);
 	}
 
-	/* calculate checksum */
 	n = m_getptr(m, hlen + off, &off);
 	if (n == NULL)
 		panic("icmp_do_exthdr: m_getptr failure");
+
+	// Ensure that we do not read beyond the buffer
+	if (off + sizeof(hdr) + len > n->m_len)
+		panic("icmp_do_exthdr: buffer overflow");
+
 	ieh = (struct icmp_ext_hdr *)(mtod(n, caddr_t) + off);
 	ieh->ieh_cksum = in4_cksum(n, 0, off, sizeof(hdr) + len);
 

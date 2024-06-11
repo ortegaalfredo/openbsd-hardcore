@@ -146,10 +146,14 @@ uint64_t	tcp_starttime;	/* [I] random offset for tcp_now() */
 void
 tcp_init(void)
 {
+	uint64_t max_tcp_starttime = (1ULL << 63) - 1;
 	tcp_iss = 1;		/* wrong */
 	/* 0 is treated special so add 1, 63 bits to count is enough */
 	arc4random_buf(&tcp_starttime, sizeof(tcp_starttime));
 	tcp_starttime = 1ULL + (tcp_starttime / 2);
+	if (tcp_starttime > max_tcp_starttime) {
+		tcp_starttime = max_tcp_starttime;
+	}
 	pool_init(&tcpcb_pool, sizeof(struct tcpcb), 0, IPL_SOFTNET, 0,
 	    "tcpcb", NULL);
 	pool_init(&tcpqe_pool, sizeof(struct tcpqent), 0, IPL_SOFTNET, 0,
@@ -173,9 +177,9 @@ tcp_init(void)
 	if (max_protohdr < (sizeof(struct ip6_hdr) + sizeof(struct tcphdr)))
 		max_protohdr = (sizeof(struct ip6_hdr) + sizeof(struct tcphdr));
 	if ((max_linkhdr + sizeof(struct ip6_hdr) + sizeof(struct tcphdr)) >
-	    MHLEN)
+	    MHLEN) {
 		panic("tcp_init");
-
+	}
 	icmp6_mtudisc_callback_register(tcp6_mtudisc_callback);
 #endif /* INET6 */
 
@@ -215,13 +219,22 @@ tcp_template(struct tcpcb *tp)
 		switch (tp->pf) {
 		case 0:	/*default to PF_INET*/
 		case AF_INET:
+			if (sizeof(struct ip) > USHRT_MAX - sizeof(struct tcphdr)) {
+				return (0);
+			}
 			m->m_len = sizeof(struct ip);
 			break;
 #ifdef INET6
 		case AF_INET6:
+			if (sizeof(struct ip6_hdr) > USHRT_MAX - sizeof(struct tcphdr)) {
+				return (0);
+			}
 			m->m_len = sizeof(struct ip6_hdr);
 			break;
 #endif /* INET6 */
+		}
+		if (m->m_len > USHRT_MAX - sizeof(struct tcphdr)) {
+			return (0);
 		}
 		m->m_len += sizeof (struct tcphdr);
 	}
@@ -230,6 +243,10 @@ tcp_template(struct tcpcb *tp)
 	case AF_INET:
 		{
 			struct ipovly *ipovly;
+
+			if (m->m_len < sizeof(struct ip)) {
+				return (0);
+			}
 
 			ipovly = mtod(m, struct ipovly *);
 
@@ -247,6 +264,10 @@ tcp_template(struct tcpcb *tp)
 	case AF_INET6:
 		{
 			struct ip6_hdr *ip6;
+
+			if (m->m_len < sizeof(struct ip6_hdr)) {
+				return (0);
+			}
 
 			ip6 = mtod(m, struct ip6_hdr *);
 
@@ -426,59 +447,72 @@ tcp_respond(struct tcpcb *tp, caddr_t template, struct tcphdr *th0,
 struct tcpcb *
 tcp_newtcpcb(struct inpcb *inp, int wait)
 {
-	struct tcpcb *tp;
-	int i;
+    struct tcpcb *tp;
+    int i;
 
-	tp = pool_get(&tcpcb_pool, (wait == M_WAIT ? PR_WAITOK : PR_NOWAIT) |
-	    PR_ZERO);
-	if (tp == NULL)
-		return (NULL);
-	TAILQ_INIT(&tp->t_segq);
-	tp->t_maxseg = tcp_mssdflt;
-	tp->t_maxopd = 0;
+    if (wait != M_WAIT && wait != PR_NOWAIT) {
+        return NULL; // Invalid wait parameter
+    }
 
-	for (i = 0; i < TCPT_NTIMERS; i++)
-		TCP_TIMER_INIT(tp, i);
+    tp = pool_get(&tcpcb_pool, (wait == M_WAIT ? PR_WAITOK : PR_NOWAIT) | PR_ZERO);
+    if (tp == NULL)
+        return (NULL);
 
-	tp->sack_enable = tcp_do_sack;
-	tp->t_flags = tcp_do_rfc1323 ? (TF_REQ_SCALE|TF_REQ_TSTMP) : 0;
-	tp->t_inpcb = inp;
-	/*
-	 * Init srtt to TCPTV_SRTTBASE (0), so we can tell that we have no
-	 * rtt estimate.  Set rttvar so that srtt + 2 * rttvar gives
-	 * reasonable initial retransmit time.
-	 */
-	tp->t_srtt = TCPTV_SRTTBASE;
-	tp->t_rttvar = tcp_rttdflt <<
-	    (TCP_RTTVAR_SHIFT + TCP_RTT_BASE_SHIFT - 1);
-	tp->t_rttmin = TCPTV_MIN;
-	TCPT_RANGESET(tp->t_rxtcur, TCP_REXMTVAL(tp),
-	    TCPTV_MIN, TCPTV_REXMTMAX);
-	tp->snd_cwnd = TCP_MAXWIN << TCP_MAX_WINSHIFT;
-	tp->snd_ssthresh = TCP_MAXWIN << TCP_MAX_WINSHIFT;
+    TAILQ_INIT(&tp->t_segq);
+    tp->t_maxseg = tcp_mssdflt;
+    tp->t_maxopd = 0;
 
-	tp->t_pmtud_mtu_sent = 0;
-	tp->t_pmtud_mss_acked = 0;
+    if (TCPT_NTIMERS <= 0 || TCPT_NTIMERS > INT_MAX) {
+        pool_put(&tcpcb_pool, tp); // Release allocated memory in case of invalid TCPT_NTIMERS
+        return NULL; // Invalid number of timers
+    }
+
+    for (i = 0; i < TCPT_NTIMERS; i++)
+        TCP_TIMER_INIT(tp, i);
+
+    tp->sack_enable = tcp_do_sack;
+    tp->t_flags = tcp_do_rfc1323 ? (TF_REQ_SCALE | TF_REQ_TSTMP) : 0;
+    tp->t_inpcb = inp;
+
+    tp->t_srtt = TCPTV_SRTTBASE;
+    tp->t_rttvar = tcp_rttdflt << (TCP_RTTVAR_SHIFT + TCP_RTT_BASE_SHIFT - 1);
+    tp->t_rttmin = TCPTV_MIN;
+
+    if (TCP_REXMTVAL(tp) < TCPTV_MIN || TCP_REXMTVAL(tp) > TCPTV_REXMTMAX) {
+        pool_put(&tcpcb_pool, tp); // Release allocated memory in case of invalid TCP_REXMTVAL
+        return NULL; // Invalid retransmit value
+    }
+    TCPT_RANGESET(tp->t_rxtcur, TCP_REXMTVAL(tp), TCPTV_MIN, TCPTV_REXMTMAX);
+
+    if (TCP_MAXWIN > (INT_MAX >> TCP_MAX_WINSHIFT)) {
+        pool_put(&tcpcb_pool, tp); // Release allocated memory in case of potential overflow
+        return NULL; // Potential overflow in snd_cwnd or snd_ssthresh
+    }
+    tp->snd_cwnd = TCP_MAXWIN << TCP_MAX_WINSHIFT;
+    tp->snd_ssthresh = TCP_MAXWIN << TCP_MAX_WINSHIFT;
+
+    tp->t_pmtud_mtu_sent = 0;
+    tp->t_pmtud_mss_acked = 0;
 
 #ifdef INET6
-	/* we disallow IPv4 mapped address completely. */
-	if ((inp->inp_flags & INP_IPV6) == 0)
-		tp->pf = PF_INET;
-	else
-		tp->pf = PF_INET6;
+    /* we disallow IPv4 mapped address completely. */
+    if ((inp->inp_flags & INP_IPV6) == 0)
+        tp->pf = PF_INET;
+    else
+        tp->pf = PF_INET6;
 #else
-	tp->pf = PF_INET;
+    tp->pf = PF_INET;
 #endif
 
 #ifdef INET6
-	if (inp->inp_flags & INP_IPV6)
-		inp->inp_ipv6.ip6_hlim = ip6_defhlim;
-	else
+    if (inp->inp_flags & INP_IPV6)
+        inp->inp_ipv6.ip6_hlim = ip6_defhlim;
+    else
 #endif /* INET6 */
-		inp->inp_ip.ip_ttl = ip_defttl;
+        inp->inp_ip.ip_ttl = ip_defttl;
 
-	inp->inp_ppcb = (caddr_t)tp;
-	return (tp);
+    inp->inp_ppcb = (caddr_t)tp;
+    return (tp);
 }
 
 /*
@@ -489,16 +523,27 @@ tcp_newtcpcb(struct inpcb *inp, int wait)
 struct tcpcb *
 tcp_drop(struct tcpcb *tp, int errno)
 {
+	if (!tp || !tp->t_inpcb || !tp->t_inpcb->inp_socket) {
+		return NULL; // Early return on null pointers
+	}
 	struct socket *so = tp->t_inpcb->inp_socket;
 
 	if (TCPS_HAVERCVDSYN(tp->t_state)) {
 		tp->t_state = TCPS_CLOSED;
-		(void) tcp_output(tp);
-		tcpstat_inc(tcps_drops);
-	} else
-		tcpstat_inc(tcps_conndrops);
-	if (errno == ETIMEDOUT && tp->t_softerror)
+		if (tcp_output(tp) == -1) { // Handle potential error case
+			return NULL;
+		}
+		if (tcps_drops < INT_MAX) { // Check for potential overflow
+			tcpstat_inc(tcps_drops);
+		}
+	} else {
+		if (tcps_conndrops < INT_MAX) { // Check for potential overflow
+			tcpstat_inc(tcps_conndrops);
+		}
+	}
+	if (errno == ETIMEDOUT && tp->t_softerror) {
 		errno = tp->t_softerror;
+	}
 	so->so_error = errno;
 	return (tcp_close(tp));
 }
@@ -546,9 +591,12 @@ tcp_freeq(struct tcpcb *tp)
 	struct tcpqent *qe;
 	int rv = 0;
 
+	if (tp == NULL) return rv;
+
 	while ((qe = TAILQ_FIRST(&tp->t_segq)) != NULL) {
 		TAILQ_REMOVE(&tp->t_segq, qe, tcpqe_q);
-		m_freem(qe->tcpqe_m);
+		if (qe->tcpqe_m != NULL)
+			m_freem(qe->tcpqe_m);
 		pool_put(&tcpqe_pool, qe);
 		rv = 1;
 	}
@@ -564,6 +612,7 @@ tcp_rscale(struct tcpcb *tp, u_long hiwat)
 {
 	tp->request_r_scale = 0;
 	while (tp->request_r_scale < TCP_MAX_WINSHIFT &&
+	       tp->request_r_scale < (sizeof(TCP_MAXWIN) * 8) && 
 	       TCP_MAXWIN << tp->request_r_scale < hiwat)
 		tp->request_r_scale++;
 }
@@ -576,28 +625,30 @@ tcp_rscale(struct tcpcb *tp, u_long hiwat)
 void
 tcp_notify(struct inpcb *inp, int error)
 {
-	struct tcpcb *tp = intotcpcb(inp);
-	struct socket *so = inp->inp_socket;
+    struct tcpcb *tp = intotcpcb(inp);
+    struct socket *so = inp->inp_socket;
 
-	/*
-	 * Ignore some errors if we are hooked up.
-	 * If connection hasn't completed, has retransmitted several times,
-	 * and receives a second error, give up now.  This is better
-	 * than waiting a long time to establish a connection that
-	 * can never complete.
-	 */
-	if (tp->t_state == TCPS_ESTABLISHED &&
-	     (error == EHOSTUNREACH || error == ENETUNREACH ||
-	      error == EHOSTDOWN)) {
-		return;
-	} else if (TCPS_HAVEESTABLISHED(tp->t_state) == 0 &&
-	    tp->t_rxtshift > 3 && tp->t_softerror)
-		so->so_error = error;
-	else
-		tp->t_softerror = error;
-	wakeup((caddr_t) &so->so_timeo);
-	sorwakeup(so);
-	sowwakeup(so);
+    if (tp == NULL || so == NULL) {
+        return;
+    }
+
+    if (tp->t_state == TCPS_ESTABLISHED &&
+         (error == EHOSTUNREACH || error == ENETUNREACH ||
+          error == EHOSTDOWN)) {
+        return;
+    } else if (TCPS_HAVEESTABLISHED(tp->t_state) == 0 &&
+        tp->t_rxtshift > 3 && tp->t_softerror) {
+        so->so_error = error;
+    } else {
+        tp->t_softerror = error;
+    }
+
+    if ((uintptr_t)&so->so_timeo < UINTPTR_MAX) {
+        wakeup((caddr_t) &so->so_timeo);
+    }
+    
+    sorwakeup(so);
+    sowwakeup(so);
 }
 
 #ifdef INET6
@@ -665,6 +716,10 @@ tcp6_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *d)
 
 		/* check if we can safely examine src and dst ports */
 		if (m->m_pkthdr.len < off + sizeof(*thp))
+			return;
+
+		/* Ensure off does not cause integer overflow */
+		if (off < 0 || off + sizeof(*thp) < off)
 			return;
 
 		bzero(&th, sizeof(th));
@@ -740,69 +795,82 @@ tcp_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 	else if (PRC_IS_REDIRECT(cmd))
 		notify = in_rtchange, ip = 0;
 	else if (cmd == PRC_MSGSIZE && ip_mtudisc && ip) {
-		/*
-		 * Verify that the packet in the icmp payload refers
-		 * to an existing TCP connection.
-		 */
-		th = (struct tcphdr *)((caddr_t)ip + (ip->ip_hl << 2));
-		seq = ntohl(th->th_seq);
-		inp = in_pcblookup(&tcbtable,
-		    ip->ip_dst, th->th_dport, ip->ip_src, th->th_sport,
-		    rdomain);
-		if (inp && (tp = intotcpcb(inp)) &&
-		    SEQ_GEQ(seq, tp->snd_una) &&
-		    SEQ_LT(seq, tp->snd_max)) {
-			struct icmp *icp;
-			icp = (struct icmp *)((caddr_t)ip -
-					      offsetof(struct icmp, icmp_ip));
+	/*
+	 * Verify that the packet in the icmp payload refers
+	 * to an existing TCP connection.
+	 */
+	if (ip->ip_hl < 5 || (ip->ip_hl << 2) > sizeof(struct ip)) {
+		return;
+	}
 
-			/*
-			 * If the ICMP message advertises a Next-Hop MTU
-			 * equal or larger than the maximum packet size we have
-			 * ever sent, drop the message.
-			 */
-			mtu = (u_int)ntohs(icp->icmp_nextmtu);
-			if (mtu >= tp->t_pmtud_mtu_sent) {
-				in_pcbunref(inp);
-				return;
-			}
-			if (mtu >= tcp_hdrsz(tp) + tp->t_pmtud_mss_acked) {
-				/*
-				 * Calculate new MTU, and create corresponding
-				 * route (traditional PMTUD).
-				 */
-				tp->t_flags &= ~TF_PMTUD_PEND;
-				icmp_mtudisc(icp, inp->inp_rtableid);
-			} else {
-				/*
-				 * Record the information got in the ICMP
-				 * message; act on it later.
-				 * If we had already recorded an ICMP message,
-				 * replace the old one only if the new message
-				 * refers to an older TCP segment
-				 */
-				if (tp->t_flags & TF_PMTUD_PEND) {
-					if (SEQ_LT(tp->t_pmtud_th_seq, seq)) {
-						in_pcbunref(inp);
-						return;
-					}
-				} else
-					tp->t_flags |= TF_PMTUD_PEND;
-				tp->t_pmtud_th_seq = seq;
-				tp->t_pmtud_nextmtu = icp->icmp_nextmtu;
-				tp->t_pmtud_ip_len = icp->icmp_ip.ip_len;
-				tp->t_pmtud_ip_hl = icp->icmp_ip.ip_hl;
-				in_pcbunref(inp);
-				return;
-			}
-		} else {
-			/* ignore if we don't have a matching connection */
+	th = (struct tcphdr *)((caddr_t)ip + (ip->ip_hl << 2));
+	if ((caddr_t)th + sizeof(struct tcphdr) > ((caddr_t)ip + ntohs(ip->ip_len))) {
+		return;
+	}
+
+	seq = ntohl(th->th_seq);
+	inp = in_pcblookup(&tcbtable,
+	    ip->ip_dst, th->th_dport, ip->ip_src, th->th_sport,
+	    rdomain);
+	if (inp && (tp = intotcpcb(inp)) &&
+	    SEQ_GEQ(seq, tp->snd_una) &&
+	    SEQ_LT(seq, tp->snd_max)) {
+		struct icmp *icp;
+		icp = (struct icmp *)((caddr_t)ip -
+				      offsetof(struct icmp, icmp_ip));
+
+		if ((caddr_t)icp + sizeof(struct icmp) > ((caddr_t)ip + ntohs(ip->ip_len))) {
 			in_pcbunref(inp);
 			return;
 		}
+
+		/*
+		 * If the ICMP message advertises a Next-Hop MTU
+		 * equal or larger than the maximum packet size we have
+		 * ever sent, drop the message.
+		 */
+		mtu = (u_int)ntohs(icp->icmp_nextmtu);
+		if (mtu >= tp->t_pmtud_mtu_sent) {
+			in_pcbunref(inp);
+			return;
+		}
+		if (mtu >= tcp_hdrsz(tp) + tp->t_pmtud_mss_acked) {
+			/*
+			 * Calculate new MTU, and create corresponding
+			 * route (traditional PMTUD).
+			 */
+			tp->t_flags &= ~TF_PMTUD_PEND;
+			icmp_mtudisc(icp, inp->inp_rtableid);
+		} else {
+			/*
+			 * Record the information got in the ICMP
+			 * message; act on it later.
+			 * If we had already recorded an ICMP message,
+			 * replace the old one only if the new message
+			 * refers to an older TCP segment
+			 */
+			if (tp->t_flags & TF_PMTUD_PEND) {
+				if (SEQ_LT(tp->t_pmtud_th_seq, seq)) {
+					in_pcbunref(inp);
+					return;
+				}
+			} else
+				tp->t_flags |= TF_PMTUD_PEND;
+			tp->t_pmtud_th_seq = seq;
+			tp->t_pmtud_nextmtu = icp->icmp_nextmtu;
+			tp->t_pmtud_ip_len = icp->icmp_ip.ip_len;
+			tp->t_pmtud_ip_hl = icp->icmp_ip.ip_hl;
+			in_pcbunref(inp);
+			return;
+		}
+	} else {
+		/* ignore if we don't have a matching connection */
 		in_pcbunref(inp);
-		notify = tcp_mtudisc, ip = 0;
-	} else if (cmd == PRC_MTUINC)
+		return;
+	}
+	in_pcbunref(inp);
+	notify = tcp_mtudisc, ip = 0;
+} else if (cmd == PRC_MTUINC)
 		notify = tcp_mtudisc_increase, ip = 0;
 	else if (cmd == PRC_HOSTDEAD)
 		ip = 0;
@@ -823,6 +891,10 @@ tcp_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 		} else if (inetctlerrmap[cmd] == EHOSTUNREACH ||
 		    inetctlerrmap[cmd] == ENETUNREACH ||
 		    inetctlerrmap[cmd] == EHOSTDOWN) {
+			if (th == NULL || ip == NULL) {
+				return;
+			}
+			
 			struct sockaddr_in sin;
 
 			bzero(&sin, sizeof(sin));
@@ -845,6 +917,12 @@ tcp_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *v)
 void
 tcp6_mtudisc_callback(struct sockaddr_in6 *sin6, u_int rdomain)
 {
+	if (sin6 == NULL)
+		return;
+		
+	if (rdomain > UINT_MAX)
+		return;
+		
 	in6_pcbnotify(&tcbtable, sin6, 0,
 	    &sa6_any, 0, rdomain, PRC_MSGSIZE, NULL, tcp_mtudisc);
 }
@@ -928,6 +1006,10 @@ tcp_set_iss_tsm(struct tcpcb *tp)
 	tcp_seq iss;
 
 	mtx_enter(&tcp_timer_mtx);
+	if ((tcp_iss + TCP_ISS_CONN_INC) < tcp_iss) {
+		mtx_leave(&tcp_timer_mtx);
+		return; // handle overflow error appropriately
+	}
 	tcp_iss += TCP_ISS_CONN_INC;
 	iss = tcp_iss;
 	mtx_leave(&tcp_timer_mtx);
@@ -948,6 +1030,9 @@ tcp_set_iss_tsm(struct tcpcb *tp)
 		    sizeof(struct in_addr));
 	}
 	SHA512Final(digest.bytes, &ctx);
+	if (digest.words[0] > UINT32_MAX - iss) {
+		return; // handle overflow error appropriately
+	}
 	tp->iss = digest.words[0] + iss;
 	tp->ts_modulate = digest.words[1];
 }
@@ -964,6 +1049,9 @@ tcp_signature_tdb_init(struct tdb *tdbp, const struct xformsw *xsp,
     struct ipsecinit *ii)
 {
 	if ((ii->ii_authkeylen < 1) || (ii->ii_authkeylen > 80))
+		return (EINVAL);
+
+	if (ii->ii_authkey == NULL)
 		return (EINVAL);
 
 	tdbp->tdb_amxkey = malloc(ii->ii_authkeylen, M_XDATA, M_NOWAIT);
@@ -991,6 +1079,11 @@ int
 tcp_signature_tdb_input(struct mbuf **mp, struct tdb *tdbp, int skip,
     int protoff)
 {
+	if (mp == NULL || tdbp == NULL || skip < 0 || protoff < 0 || 
+        skip > INT_MAX - protoff) {
+		return (IPPROTO_DONE);
+	}
+
 	m_freemp(mp);
 	return (IPPROTO_DONE);
 }
@@ -999,6 +1092,12 @@ int
 tcp_signature_tdb_output(struct mbuf *m, struct tdb *tdbp, int skip,
     int protoff)
 {
+	if (m == NULL || tdbp == NULL || skip < 0 || protoff < 0) {
+		if (m != NULL) {
+			m_freem(m);
+		}
+		return (EINVAL);
+	}
 	m_freem(m);
 	return (EINVAL);
 }

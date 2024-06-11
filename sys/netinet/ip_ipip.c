@@ -113,11 +113,23 @@ ipip_input(struct mbuf **mp, int *offp, int nxt, int af)
 		return IPPROTO_DONE;
 	}
 
+	if (mp == NULL || *mp == NULL || offp == NULL) {
+		DPRINTF("Invalid input parameters");
+		return IPPROTO_DONE;
+	}
+
+	if (af < 0 || af > UCHAR_MAX) {
+		DPRINTF("Invalid address family");
+		m_freemp(mp);
+		return IPPROTO_DONE;
+	}
+
 	ifp = if_get((*mp)->m_pkthdr.ph_ifidx);
 	if (ifp == NULL) {
 		m_freemp(mp);
 		return IPPROTO_DONE;
 	}
+
 	nxt = ipip_input_if(mp, offp, nxt, af, ifp);
 	if_put(ifp);
 
@@ -547,6 +559,9 @@ ipe4_attach(void)
 int
 ipe4_init(struct tdb *tdbp, const struct xformsw *xsp, struct ipsecinit *ii)
 {
+	if (tdbp == NULL || xsp == NULL || ii == NULL) {
+		return -1; // Return error if any pointer is NULL
+	}
 	tdbp->tdb_xform = xsp;
 	return 0;
 }
@@ -560,6 +575,10 @@ ipe4_zeroize(struct tdb *tdbp)
 int
 ipe4_input(struct mbuf **mp, struct tdb *tdb, int hlen, int proto)
 {
+	if (mp == NULL || *mp == NULL || tdb == NULL || hlen < 0 || proto < 0) {
+		return EINVAL;
+	}
+
 	/* This is a rather serious mistake, so no conditional printing. */
 	printf("%s: should never be called\n", __func__);
 	m_freemp(mp);
@@ -570,14 +589,25 @@ ipe4_input(struct mbuf **mp, struct tdb *tdb, int hlen, int proto)
 int
 ipip_sysctl_ipipstat(void *oldp, size_t *oldlenp, void *newp)
 {
-	struct ipipstat ipipstat;
+    struct ipipstat ipipstat;
 
-	CTASSERT(sizeof(ipipstat) == (ipips_ncounters * sizeof(uint64_t)));
-	memset(&ipipstat, 0, sizeof ipipstat);
-	counters_read(ipipcounters, (uint64_t *)&ipipstat, ipips_ncounters,
-	    NULL);
-	return (sysctl_rdstruct(oldp, oldlenp, newp,
-	    &ipipstat, sizeof(ipipstat)));
+    if (oldlenp == NULL || *oldlenp < sizeof(ipipstat)) {
+        return -1;  // Error: invalid length
+    }
+
+    if ((size_t)(ipips_ncounters * sizeof(uint64_t)) != sizeof(ipipstat)) {
+        return -1;  // Error: inconsistent size
+    }
+
+    memset(&ipipstat, 0, sizeof ipipstat);
+
+    if (ipips_ncounters > 0 && ipipcounters != NULL) {
+        counters_read(ipipcounters, (uint64_t *)&ipipstat, ipips_ncounters, NULL);
+    } else {
+        return -1;  // Error: invalid counter state
+    }
+
+    return (sysctl_rdstruct(oldp, oldlenp, newp, &ipipstat, sizeof(ipipstat)));
 }
 
 int
@@ -589,6 +619,10 @@ ipip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
+
+	/* Check for potential NULL pointers */
+	if (name == NULL || (oldp == NULL && oldlenp == NULL && newp == NULL) || oldlenp == NULL)
+		return (EINVAL);
 
 	switch (name[0]) {
 	case IPIPCTL_ALLOW:

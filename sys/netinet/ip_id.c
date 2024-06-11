@@ -70,10 +70,13 @@ ip_randomid(void)
 		arc4random_buf(&si, sizeof(si));
 		i = isindex & 0xFFFF;
 		i2 = (isindex - (si & 0x7FFF)) & 0xFFFF;
+		if (i >= nitems(ip_shuffle) || i2 >= nitems(ip_shuffle)) {
+			continue;
+		}
 		r = ip_shuffle[i];
 		ip_shuffle[i] = ip_shuffle[i2];
 		ip_shuffle[i2] = r;
-		isindex++;
+		isindex = (isindex + 1) & 0xFFFFFFFF;  // Prevent integer overflow by wrapping within 32 bits
 	} while (r == 0);
 
 	return (r);

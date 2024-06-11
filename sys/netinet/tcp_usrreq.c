@@ -184,6 +184,10 @@ tcp_sogetpcb(struct socket *so, struct inpcb **rinp, struct tcpcb **rtp)
 	struct inpcb *inp;
 	struct tcpcb *tp;
 
+	if (so == NULL || rinp == NULL || rtp == NULL) {
+		return EINVAL;
+	}
+
 	/*
 	 * When a TCP is attached to a socket, then there will be
 	 * a (struct inpcb) pointed at by the socket, and this
@@ -512,6 +516,9 @@ tcp_detach(struct socket *so)
 		return (error);
 
 	if (so->so_options & SO_DEBUG) {
+		// Check for potential null pointer dereference
+        if (!tp) 
+            return (EINVAL); // Use an appropriate error code for "Invalid Argument"
 		otp = tp;
 		ostate = tp->t_state;
 	}
@@ -527,6 +534,7 @@ tcp_detach(struct socket *so)
 
 	if (otp)
 		tcp_trace(TA_USER, ostate, tp, otp, NULL, PRU_DETACH, 0);
+
 	return (0);
 }
 
@@ -572,14 +580,20 @@ tcp_listen(struct socket *so)
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		return (error);
 
+	if (!inp || !tp) // Check for null pointers
+		return (EINVAL);
+
 	if (so->so_options & SO_DEBUG) {
 		otp = tp;
+		if (otp == NULL) // Check for null pointer
+			return (EINVAL);
 		ostate = tp->t_state;
 	}
 
-	if (inp->inp_lport == 0)
+	if (inp->inp_lport == 0) {
 		if ((error = in_pcbbind(inp, NULL, curproc)))
 			goto out;
+	}
 
 	/*
 	 * If the in_pcbbind() above is called, the tp->pf
@@ -624,7 +638,8 @@ tcp_connect(struct socket *so, struct mbuf *nam)
 
 		if ((error = in6_nam2sin6(nam, &sin6)))
 			goto out;
-		if (IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr) ||
+		if (!sin6 || (char *)sin6 < (char *)nam || (char *)sin6 >= (char *)nam + sizeof(*sin6) || 
+		    IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr) ||
 		    IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
 			error = EINVAL;
 			goto out;
@@ -644,6 +659,17 @@ tcp_connect(struct socket *so, struct mbuf *nam)
 			goto out;
 		}
 	}
+
+	if (nam == NULL || inp == NULL) {
+		error = EINVAL;
+		goto out;
+	}
+
+	if (nam->m_len < sizeof(struct sockaddr)) {
+		error = EINVAL;
+		goto out;
+	}
+
 	error = in_pcbconnect(inp, nam);
 	if (error)
 		goto out;
@@ -687,10 +713,16 @@ tcp_accept(struct socket *so, struct mbuf *nam)
 	struct tcpcb *tp;
 	int error;
 
+	if (so == NULL || nam == NULL)
+		return (EINVAL);
+
 	soassertlocked(so);
 
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		return (error);
+
+	if (inp == NULL || tp == NULL)
+		return (EINVAL);
 
 	in_setpeeraddr(inp, nam);
 
@@ -719,6 +751,16 @@ tcp_disconnect(struct socket *so)
 	short ostate;
 
 	soassertlocked(so);
+
+	// Ensure 'so' is not NULL
+	if (so == NULL) {
+		return EINVAL;
+	}
+
+	// Ensure 'so->so_options' is a valid value
+	if (so->so_options & ~SO_DEBUG) {
+		return EINVAL;
+	}
 
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		return (error);
@@ -760,13 +802,16 @@ tcp_shutdown(struct socket *so)
 		goto out;
 
 	socantsendmore(so);
-	tp = tcp_usrclosed(tp);
-	if (tp)
-		error = tcp_output(tp);
+	if (tp != NULL) {
+		tp = tcp_usrclosed(tp);
+		if (tp)
+			error = tcp_output(tp);
+	}
 
 out:
-	if (otp)
+	if (otp && tp != NULL) {
 		tcp_trace(TA_USER, ostate, tp, otp, NULL, PRU_SHUTDOWN, 0);
+	}
 	return (error);
 }
 
@@ -825,6 +870,12 @@ tcp_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		goto out;
 
+	// Check for integer overflow in so->so_snd.sb_cc before sbappendstream
+	if (so->so_snd.sb_cc > INT_MAX - (m ? m->m_len : 0)) {
+		error = EOVERFLOW;
+		goto out;
+	}
+
 	if (so->so_options & SO_DEBUG)
 		ostate = tp->t_state;
 
@@ -853,6 +904,8 @@ tcp_abort(struct socket *so)
 	struct tcpcb *tp, *otp = NULL;
 	short ostate;
 
+	if (!so) return;  // Check for null pointer
+	
 	soassertlocked(so);
 
 	if (tcp_sogetpcb(so, &inp, &tp))
@@ -863,9 +916,11 @@ tcp_abort(struct socket *so)
 		ostate = tp->t_state;
 	}
 
+	if (!tp) return;  // Check for null pointer
+
 	tp = tcp_drop(tp, ECONNABORTED);
 
-	if (otp)
+	if (otp && tp) // Ensure tp is not null before dereference
 		tcp_trace(TA_USER, ostate, tp, otp, NULL, PRU_ABORT, 0);
 }
 
@@ -880,6 +935,12 @@ tcp_sense(struct socket *so, struct stat *ub)
 
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		return (error);
+
+	if (ub == NULL || so == NULL)
+		return (EINVAL);
+
+	if (so->so_snd.sb_hiwat > INT_MAX)
+		return (EOVERFLOW);
 
 	ub->st_blksize = so->so_snd.sb_hiwat;
 
@@ -909,6 +970,10 @@ tcp_rcvoob(struct socket *so, struct mbuf *m, int flags)
 	}
 	if ((tp->t_oobflags & TCPOOB_HAVEDATA) == 0) {
 		error = EWOULDBLOCK;
+		goto out;
+	}
+	if (m == NULL || mtod(m, caddr_t) == NULL || m->m_len < 1) {
+		error = EINVAL;
 		goto out;
 	}
 	m->m_len = 1;
@@ -956,9 +1021,13 @@ tcp_sendoob(struct socket *so, struct mbuf *m, struct mbuf *nam,
 	 * of data past the urgent section.
 	 * Otherwise, snd_up should be one lower.
 	 */
+	if (__builtin_add_overflow(tp->snd_una, so->so_snd.sb_cc, &tp->snd_up)) {
+		error = EOVERFLOW;
+		goto out;
+	}
+
 	sbappendstream(so, &so->so_snd, m);
 	m = NULL;
-	tp->snd_up = tp->snd_una + so->so_snd.sb_cc;
 	tp->t_force = 1;
 	error = tcp_output(tp);
 	tp->t_force = 0;
@@ -986,6 +1055,9 @@ tcp_sockaddr(struct socket *so, struct mbuf *nam)
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		return (error);
 
+	if (nam == NULL || nam->m_len < sizeof(struct sockaddr_in))
+		return (EINVAL);
+
 	in_setsockaddr(inp, nam);
 
 	if (so->so_options & SO_DEBUG)
@@ -1006,6 +1078,9 @@ tcp_peeraddr(struct socket *so, struct mbuf *nam)
 	if ((error = tcp_sogetpcb(so, &inp, &tp)))
 		return (error);
 
+	if (nam == NULL || nam->m_len < sizeof(struct sockaddr_in)) // Check for NULL and minimum length
+		return (EINVAL);
+
 	in_setpeeraddr(inp, nam);
 
 	if (so->so_options & SO_DEBUG)
@@ -1024,7 +1099,10 @@ tcp_peeraddr(struct socket *so, struct mbuf *nam)
 struct tcpcb *
 tcp_dodisconnect(struct tcpcb *tp)
 {
-	struct socket *so = tp->t_inpcb->inp_socket;
+	struct socket *so;
+	if (tp == NULL || tp->t_inpcb == NULL || (so = tp->t_inpcb->inp_socket) == NULL) {
+		return NULL; // Avoid null pointer dereference
+	}
 
 	if (TCPS_HAVEESTABLISHED(tp->t_state) == 0)
 		tp = tcp_close(tp);
@@ -1037,6 +1115,7 @@ tcp_dodisconnect(struct tcpcb *tp)
 		if (tp)
 			(void) tcp_output(tp);
 	}
+
 	return (tp);
 }
 
@@ -1110,14 +1189,14 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 			return (EINVAL);
 		if (newp == NULL)
 			return (EPERM);
-		if (newlen < sizeof(tir))
+		if (newlen < sizeof(tir) || newlen > SIZE_MAX)
 			return (ENOMEM);
 		if ((error = copyin(newp, &tir, sizeof (tir))) != 0 )
 			return (error);
 	} else {
 		if (oldp == NULL)
 			return (EINVAL);
-		if (*oldlenp < sizeof(tir))
+		if (*oldlenp < sizeof(tir) || *oldlenp > SIZE_MAX)
 			return (ENOMEM);
 		if (newp != NULL || newlen != 0)
 			return (EINVAL);
@@ -1195,6 +1274,9 @@ tcp_ident(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int dodrop)
 	}
 
 	*oldlenp = sizeof (tir);
+	if (*oldlenp > SIZE_MAX) {
+		return (EOVERFLOW);
+	}
 	error = copyout((void *)&tir, oldp, sizeof (tir));
 	in_pcbunref(inp);
 	return (error);
@@ -1504,6 +1586,7 @@ tcp_update_sndspace(struct tcpcb *tp)
 {
 	struct socket *so = tp->t_inpcb->inp_socket;
 	u_long nmax = so->so_snd.sb_hiwat;
+	u_long calc_nmax;
 
 	if (sbchecklowmem()) {
 		/* low on memory try to get rid of some */
@@ -1512,22 +1595,35 @@ tcp_update_sndspace(struct tcpcb *tp)
 	} else if (so->so_snd.sb_wat != tcp_sendspace)
 		/* user requested buffer size, auto-scaling disabled */
 		nmax = so->so_snd.sb_wat;
-	else
+	else {
 		/* automatic buffer scaling */
-		nmax = MIN(sb_max, so->so_snd.sb_wat + tp->snd_max -
-		    tp->snd_una);
+		if (__builtin_add_overflow(so->so_snd.sb_wat, tp->snd_max, &calc_nmax) ||
+		    __builtin_sub_overflow(calc_nmax, tp->snd_una, &nmax) ||
+		    nmax > sb_max) {
+			nmax = sb_max;
+		}
+	}
 
 	/* a writable socket must be preserved because of poll(2) semantics */
 	if (sbspace(so, &so->so_snd) >= so->so_snd.sb_lowat) {
-		if (nmax < so->so_snd.sb_cc + so->so_snd.sb_lowat)
-			nmax = so->so_snd.sb_cc + so->so_snd.sb_lowat;
+		if (__builtin_add_overflow(so->so_snd.sb_cc, so->so_snd.sb_lowat, &calc_nmax) ||
+		    nmax < calc_nmax)
+			nmax = calc_nmax;
+
 		/* keep in sync with sbreserve() calculation */
-		if (nmax * 8 < so->so_snd.sb_mbcnt + so->so_snd.sb_lowat)
-			nmax = (so->so_snd.sb_mbcnt+so->so_snd.sb_lowat+7) / 8;
+		if (__builtin_add_overflow(so->so_snd.sb_mbcnt, so->so_snd.sb_lowat, &calc_nmax) ||
+		    __builtin_add_overflow(calc_nmax, 7, &calc_nmax) ||
+		    __builtin_mul_overflow(nmax, 8, &nmax) ||
+		    nmax < calc_nmax)
+			nmax = (calc_nmax + 7) / 8;
 	}
 
 	/* round to MSS boundary */
-	nmax = roundup(nmax, tp->t_maxseg);
+	if (__builtin_mul_overflow(nmax, tp->t_maxseg, &calc_nmax)) {
+		nmax = tp->t_maxseg;
+	} else {
+		nmax = roundup(nmax, tp->t_maxseg);
+	}
 
 	if (nmax != so->so_snd.sb_hiwat)
 		sbreserve(so, &so->so_snd, nmax);
@@ -1554,9 +1650,13 @@ tcp_update_rcvspace(struct tcpcb *tp)
 		nmax = so->so_rcv.sb_wat;
 	else {
 		/* automatic buffer scaling */
-		if (tp->rfbuf_cnt > so->so_rcv.sb_hiwat / 8 * 7)
-			nmax = MIN(sb_max, so->so_rcv.sb_hiwat +
-			    tcp_autorcvbuf_inc);
+		if (tp->rfbuf_cnt > so->so_rcv.sb_hiwat / 8 * 7) {
+			u_long new_max = so->so_rcv.sb_hiwat + tcp_autorcvbuf_inc;
+			if (new_max > sb_max || new_max < so->so_rcv.sb_hiwat) // Check for overflow
+				nmax = sb_max;
+			else
+				nmax = new_max;
+		}
 	}
 
 	/* a readable socket must be preserved because of poll(2) semantics */
@@ -1568,6 +1668,9 @@ tcp_update_rcvspace(struct tcpcb *tp)
 		return;
 
 	/* round to MSS boundary */
-	nmax = roundup(nmax, tp->t_maxseg);
-	sbreserve(so, &so->so_rcv, nmax);
+	u_long rounded_nmax = roundup(nmax, tp->t_maxseg);
+	if (rounded_nmax < nmax || rounded_nmax > sb_max) // Check for roundup overflow
+		return;
+
+	sbreserve(so, &so->so_rcv, rounded_nmax);
 }

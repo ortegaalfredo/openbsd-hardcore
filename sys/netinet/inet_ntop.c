@@ -65,7 +65,7 @@ sockaddr_ntop(struct sockaddr *sa, char *dst, size_t size)
 	u_int8_t l;
 	size_t n;
 
-	if (sa->sa_len < 2)
+	if (!sa || !dst || size == 0 || sa->sa_len < 2)
 		return "bad sa";
 	switch (sa->sa_family) {
 	case AF_INET:
@@ -75,14 +75,18 @@ sockaddr_ntop(struct sockaddr *sa, char *dst, size_t size)
 		return inet_ntop6((u_char *)&satosin6(sa)->sin6_addr, dst, size);
 #endif
 	default:
+		if (size < 2)
+			return "bad sa";
 		n = snprintf(dst, size, "%d ", sa->sa_family);
+		if (n >= size)
+			return "bad sa";
 		for (l = 0; l < sa->sa_len - offsetof(struct sockaddr, sa_data); l++) {
+			if (n + 2 >= size)
+				return "bad sa";
 			int r = snprintf(dst + n, size - n, "%02x", sa->sa_data[l]);
-			if (r == -1)
+			if (r < 0 || r >= size - n)
 				return "bad sa";
 			n += r;
-			if (n > size)
-				n = size;
 		}
 		return (dst);
 	}
@@ -105,9 +109,13 @@ inet_ntop4(const u_char *src, char *dst, size_t size)
 	char tmp[sizeof "255.255.255.255"];
 	int l;
 
+	if (src == NULL || dst == NULL || size == 0) {
+		return (NULL);
+	}
+
 	l = snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u",
 	    src[0], src[1], src[2], src[3]);
-	if (l <= 0 || l >= size) {
+	if (l <= 0 || l >= sizeof(tmp) || l >= size) {
 		return (NULL);
 	}
 	strlcpy(dst, tmp, size);
@@ -200,7 +208,7 @@ inet_ntop6(const u_char *src, char *dst, size_t size)
 			break;
 		}
 		advance = snprintf(tp, ep - tp, "%x", words[i]);
-		if (advance <= 0 || advance >= ep - tp)
+		if (advance < 0 || (size_t)advance >= (size_t)(ep - tp))
 			return (NULL);
 		tp += advance;
 	}

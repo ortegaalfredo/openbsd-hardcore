@@ -189,6 +189,10 @@ rip_input(struct mbuf **mp, int *offp, int proto, int af)
 		    inp->inp_faddr.s_addr != ip->ip_src.s_addr)
 			continue;
 
+        if (inp->inp_socket == NULL || inp->inp_socket->so_rcv.sb_cc >= sb_max || inp->inp_socket->so_rcv.sb_cc + m->m_pkthdr.len < m->m_pkthdr.len) {
+            continue;
+        }
+
 		in_pcbref(inp);
 		SIMPLEQ_INSERT_TAIL(&inpcblist, inp, inp_notify);
 	}
@@ -254,152 +258,160 @@ int
 rip_output(struct mbuf *m, struct socket *so, struct sockaddr *dstaddr,
     struct mbuf *control)
 {
-	struct sockaddr_in *dst = satosin(dstaddr);
-	struct ip *ip;
-	struct inpcb *inp;
-	int flags, error;
+    struct sockaddr_in *dst = satosin(dstaddr);
+    struct ip *ip;
+    struct inpcb *inp;
+    int flags, error;
 
-	inp = sotoinpcb(so);
-	flags = IP_ALLOWBROADCAST;
+    inp = sotoinpcb(so);
+    flags = IP_ALLOWBROADCAST;
 
-	/*
-	 * If the user handed us a complete IP packet, use it.
-	 * Otherwise, allocate an mbuf for a header and fill it in.
-	 */
-	if ((inp->inp_flags & INP_HDRINCL) == 0) {
-		if ((m->m_pkthdr.len + sizeof(struct ip)) > IP_MAXPACKET) {
-			m_freem(m);
-			return (EMSGSIZE);
-		}
-		M_PREPEND(m, sizeof(struct ip), M_DONTWAIT);
-		if (!m)
-			return (ENOBUFS);
-		ip = mtod(m, struct ip *);
-		ip->ip_tos = inp->inp_ip.ip_tos;
-		ip->ip_off = htons(0);
-		ip->ip_p = inp->inp_ip.ip_p;
-		ip->ip_len = htons(m->m_pkthdr.len);
-		ip->ip_src.s_addr = INADDR_ANY;
-		ip->ip_dst = dst->sin_addr;
-		ip->ip_ttl = inp->inp_ip.ip_ttl ? inp->inp_ip.ip_ttl : MAXTTL;
-	} else {
-		if (m->m_pkthdr.len > IP_MAXPACKET) {
-			m_freem(m);
-			return (EMSGSIZE);
-		}
+    /*
+     * If the user handed us a complete IP packet, use it.
+     * Otherwise, allocate an mbuf for a header and fill it in.
+     */
+    if ((inp->inp_flags & INP_HDRINCL) == 0) {
+        if ((m->m_pkthdr.len + sizeof(struct ip)) > IP_MAXPACKET || (m->m_pkthdr.len + sizeof(struct ip)) < m->m_pkthdr.len) {
+            m_freem(m);
+            return (EMSGSIZE);
+        }
+        M_PREPEND(m, sizeof(struct ip), M_DONTWAIT);
+        if (!m)
+            return (ENOBUFS);
+        ip = mtod(m, struct ip *);
+        ip->ip_tos = inp->inp_ip.ip_tos;
+        ip->ip_off = htons(0);
+        ip->ip_p = inp->inp_ip.ip_p;
+        ip->ip_len = htons(m->m_pkthdr.len);
+        ip->ip_src.s_addr = INADDR_ANY;
+        ip->ip_dst = dst->sin_addr;
+        ip->ip_ttl = inp->inp_ip.ip_ttl ? inp->inp_ip.ip_ttl : MAXTTL;
+    } else {
+        if (m->m_pkthdr.len > IP_MAXPACKET) {
+            m_freem(m);
+            return (EMSGSIZE);
+        }
 
-		m = rip_chkhdr(m, inp->inp_options);
-		if (m == NULL)
-			return (EINVAL);
+        m = rip_chkhdr(m, inp->inp_options);
+        if (m == NULL)
+            return (EINVAL);
 
-		ip = mtod(m, struct ip *);
-		if (ip->ip_id == 0)
-			ip->ip_id = htons(ip_randomid());
-		dst->sin_addr = ip->ip_dst;
+        ip = mtod(m, struct ip *);
+        if (ip->ip_id == 0)
+            ip->ip_id = htons(ip_randomid());
+        dst->sin_addr = ip->ip_dst;
 
-		/* XXX prevent ip_output from overwriting header fields */
-		flags |= IP_RAWOUTPUT;
-		ipstat_inc(ips_rawout);
-	}
+        /* XXX prevent ip_output from overwriting header fields */
+        flags |= IP_RAWOUTPUT;
+        ipstat_inc(ips_rawout);
+    }
 
-	if (ip->ip_src.s_addr == INADDR_ANY) {
-		error = in_pcbselsrc(&ip->ip_src, dst, inp);
-		if (error != 0)
-			return (error);
-	}
+    if (ip->ip_src.s_addr == INADDR_ANY) {
+        error = in_pcbselsrc(&ip->ip_src, dst, inp);
+        if (error != 0)
+            return (error);
+    }
 
 #ifdef INET6
-	/*
-	 * A thought:  Even though raw IP shouldn't be able to set IPv6
-	 *             multicast options, if it does, the last parameter to
-	 *             ip_output should be guarded against v6/v4 problems.
-	 */
+    /*
+     * A thought:  Even though raw IP shouldn't be able to set IPv6
+     *             multicast options, if it does, the last parameter to
+     *             ip_output should be guarded against v6/v4 problems.
+     */
 #endif
-	/* force routing table */
-	m->m_pkthdr.ph_rtableid = inp->inp_rtableid;
+    /* force routing table */
+    m->m_pkthdr.ph_rtableid = inp->inp_rtableid;
 
 #if NPF > 0
-	if (inp->inp_socket->so_state & SS_ISCONNECTED &&
-	    ip->ip_p != IPPROTO_ICMP)
-		pf_mbuf_link_inpcb(m, inp);
+    if (inp->inp_socket->so_state & SS_ISCONNECTED &&
+        ip->ip_p != IPPROTO_ICMP)
+        pf_mbuf_link_inpcb(m, inp);
 #endif
 
-	error = ip_output(m, inp->inp_options, &inp->inp_route, flags,
-	    inp->inp_moptions, inp->inp_seclevel, 0);
-	return (error);
+    error = ip_output(m, inp->inp_options, &inp->inp_route, flags,
+        inp->inp_moptions, inp->inp_seclevel, 0);
+    return (error);
 }
 
 struct mbuf *
 rip_chkhdr(struct mbuf *m, struct mbuf *options)
 {
-	struct ip *ip;
-	int hlen, opt, optlen, cnt;
-	u_char *cp;
+    struct ip *ip;
+    int hlen, opt, optlen, cnt;
+    u_char *cp;
 
-	if (m->m_pkthdr.len < sizeof(struct ip)) {
-		m_freem(m);
-		return NULL;
-	}
+    if (m->m_pkthdr.len < sizeof(struct ip)) {
+        m_freem(m);
+        return NULL;
+    }
 
-	m = m_pullup(m, sizeof (struct ip));
-	if (m == NULL)
-		return NULL;
+    m = m_pullup(m, sizeof(struct ip));
+    if (m == NULL)
+        return NULL;
 
-	ip = mtod(m, struct ip *);
-	hlen = ip->ip_hl << 2;
+    ip = mtod(m, struct ip *);
+    hlen = ip->ip_hl << 2;
 
-	/* Don't allow packet length sizes that will crash. */
-	if (hlen < sizeof (struct ip) ||
-	    ntohs(ip->ip_len) < hlen ||
-	    ntohs(ip->ip_len) != m->m_pkthdr.len) {
-		m_freem(m);
-		return NULL;
-	}
-	m = m_pullup(m, hlen);
-	if (m == NULL)
-		return NULL;
+    /* Don't allow packet length sizes that will crash. */
+    if (hlen < sizeof(struct ip) ||
+        ntohs(ip->ip_len) < hlen ||
+        ntohs(ip->ip_len) != m->m_pkthdr.len) {
+        m_freem(m);
+        return NULL;
+    }
+    m = m_pullup(m, hlen);
+    if (m == NULL)
+        return NULL;
 
-	ip = mtod(m, struct ip *);
+    ip = mtod(m, struct ip *);
 
-	if (ip->ip_v != IPVERSION) {
-		m_freem(m);
-		return NULL;
-	}
+    if (ip->ip_v != IPVERSION) {
+        m_freem(m);
+        return NULL;
+    }
 
-	/*
-	 * Don't allow both user specified and setsockopt options.
-	 * If options are present verify them.
-	 */
-	if (hlen != sizeof(struct ip)) {
-		if (options) {
-			m_freem(m);
-			return NULL;
-		} else {
-			cp = (u_char *)(ip + 1);
-			cnt = hlen - sizeof(struct ip);
-			for (; cnt > 0; cnt -= optlen, cp += optlen) {
-				opt = cp[IPOPT_OPTVAL];
-				if (opt == IPOPT_EOL)
-					break;
-				if (opt == IPOPT_NOP)
-					optlen = 1;
-				else {
-					if (cnt < IPOPT_OLEN + sizeof(*cp)) {
-						m_freem(m);
-						return NULL;
-					}
-					optlen = cp[IPOPT_OLEN];
-					if (optlen < IPOPT_OLEN + sizeof(*cp) ||
-					    optlen > cnt) {
-						m_freem(m);
-						return NULL;
-					}
-				}
-			}
-		}
-	}
+    /*
+     * Don't allow both user specified and setsockopt options.
+     * If options are present verify them.
+     */
+    if (hlen != sizeof(struct ip)) {
+        if (options) {
+            m_freem(m);
+            return NULL;
+        } else {
+            cp = (u_char *)(ip + 1);
+            cnt = hlen - sizeof(struct ip);
+            for (; cnt > 0; cnt -= optlen, cp += optlen) {
+                if (cnt <= 0) {
+                    m_freem(m);
+                    return NULL;
+                }
+                if (cp + IPOPT_OLEN + sizeof(*cp) > (u_char *)ip + ntohs(ip->ip_len)) {
+                    m_freem(m);
+                    return NULL;
+                }
+                opt = cp[IPOPT_OPTVAL];
+                if (opt == IPOPT_EOL)
+                    break;
+                if (opt == IPOPT_NOP)
+                    optlen = 1;
+                else {
+                    if (cnt < IPOPT_OLEN + sizeof(*cp)) {
+                        m_freem(m);
+                        return NULL;
+                    }
+                    optlen = cp[IPOPT_OLEN];
+                    if (optlen < IPOPT_OLEN + sizeof(*cp) ||
+                        optlen > cnt) {
+                        m_freem(m);
+                        return NULL;
+                    }
+                }
+            }
+        }
+    }
 
-	return m;
+    return m;
 }
 
 /*
@@ -420,13 +432,20 @@ rip_ctloutput(int op, struct socket *so, int level, int optname,
 	case IP_HDRINCL:
 		error = 0;
 		if (op == PRCO_SETOPT) {
-			if (m == NULL || m->m_len < sizeof (int))
+			if (m == NULL || m->m_len < sizeof(int)) {
 				error = EINVAL;
-			else if (*mtod(m, int *))
-				inp->inp_flags |= INP_HDRINCL;
-			else
-				inp->inp_flags &= ~INP_HDRINCL;
+			} else {
+				int value = *mtod(m, int *);
+				if (value) {
+					inp->inp_flags |= INP_HDRINCL;
+				} else {
+					inp->inp_flags &= ~INP_HDRINCL;
+				}
+			}
 		} else {
+			if (m == NULL || m->m_len < sizeof(int)) {
+				return (EINVAL);
+			}
 			m->m_len = sizeof(int);
 			*mtod(m, int *) = inp->inp_flags & INP_HDRINCL;
 		}
@@ -471,6 +490,9 @@ rip_attach(struct socket *so, int proto, int wait)
 	struct inpcb *inp;
 	int error;
 
+	if (so == NULL)
+		return EINVAL; // Check for null socket pointer
+
 	if (so->so_pcb)
 		panic("rip_attach");
 	if ((so->so_state & SS_PRIV) == 0)
@@ -483,7 +505,11 @@ rip_attach(struct socket *so, int proto, int wait)
 	NET_ASSERT_LOCKED();
 	if ((error = in_pcballoc(so, &rawcbtable, wait)))
 		return error;
+
 	inp = sotoinpcb(so);
+	if (inp == NULL)
+		return ENOMEM; // Check if inpcb allocation failed
+
 	inp->inp_ip.ip_p = proto;
 	return 0;
 }
@@ -510,7 +536,14 @@ rip_detach(struct socket *so)
 void
 rip_lock(struct socket *so)
 {
+	if (so == NULL) {
+		return;
+	}
 	struct inpcb *inp = sotoinpcb(so);
+
+	if (inp == NULL) {
+		return;
+	}
 
 	NET_ASSERT_LOCKED();
 	mtx_enter(&inp->inp_mtx);
@@ -528,7 +561,17 @@ rip_unlock(struct socket *so)
 int
 rip_locked(struct socket *so)
 {
-	struct inpcb *inp = sotoinpcb(so);
+	struct inpcb *inp;
+
+	if (so == NULL) {
+		return 0; // or handle error appropriately
+	}
+
+	inp = sotoinpcb(so);
+
+	if (inp == NULL) {
+		return 0; // or handle error appropriately
+	}
 
 	return mtx_owned(&inp->inp_mtx);
 }
@@ -544,7 +587,14 @@ rip_bind(struct socket *so, struct mbuf *nam, struct proc *p)
 
 	if ((error = in_nam2sin(nam, &addr)))
 		return (error);
-	
+
+	if (addr == NULL)
+		return (EINVAL);
+
+	/* Validate addr->sin_family and addr->sin_len to ensure valid sockaddr_in */
+	if (addr->sin_family != AF_INET || addr->sin_len != sizeof(struct sockaddr_in))
+		return (EINVAL);
+
 	if (!((so->so_options & SO_BINDANY) ||
 	    addr->sin_addr.s_addr == INADDR_ANY ||
 	    addr->sin_addr.s_addr == INADDR_BROADCAST ||
@@ -553,9 +603,15 @@ rip_bind(struct socket *so, struct mbuf *nam, struct proc *p)
 		return (EADDRNOTAVAIL);
 
 	mtx_enter(&rawcbtable.inpt_mtx);
+
+	/* Validate inp before dereferencing */
+	if (inp == NULL) {
+		mtx_leave(&rawcbtable.inpt_mtx);
+		return (EINVAL);
+	}
 	inp->inp_laddr = addr->sin_addr;
 	mtx_leave(&rawcbtable.inpt_mtx);
-	
+
 	return (0);
 }
 
@@ -570,7 +626,11 @@ rip_connect(struct socket *so, struct mbuf *nam)
 
 	if ((error = in_nam2sin(nam, &addr)))
 		return (error);
-	
+
+	if (!addr || addr->sin_family != AF_INET || addr->sin_len != sizeof(*addr)) {
+		return (EINVAL);
+	}
+
 	mtx_enter(&rawcbtable.inpt_mtx);
 	inp->inp_faddr = addr->sin_addr;
 	mtx_leave(&rawcbtable.inpt_mtx);
@@ -583,6 +643,9 @@ int
 rip_disconnect(struct socket *so)
 {
 	struct inpcb *inp = sotoinpcb(so);
+
+	if (inp == NULL)
+		return (EINVAL);
 
 	soassertlocked(so);
 
@@ -642,6 +705,10 @@ rip_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 		}
 		if ((error = in_nam2sin(nam, &addr)))
 			goto out;
+		if (addr == NULL) {
+			error = EINVAL;
+			goto out;
+		}
 		dst.sin_addr = addr->sin_addr;
 	}
 #ifdef IPSEC
@@ -651,8 +718,8 @@ rip_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 	m = NULL;
 
 out:
-	m_freem(control);
-	m_freem(m);
+	if (control != NULL) m_freem(control);
+	if (m != NULL) m_freem(m);
 
 	return (error);
 }

@@ -77,7 +77,7 @@ spd_table_get(unsigned int rtableid)
 		return (NULL);
 
 	rdomain = rtable_l2(rtableid);
-	if (rdomain > spd_table_max)
+	if (rdomain > spd_table_max || rdomain >= UINT_MAX || rdomain >= sizeof(spd_tables)/sizeof(spd_tables[0]))
 		return (NULL);
 
 	return (spd_tables[rdomain]);
@@ -94,11 +94,17 @@ spd_table_add(unsigned int rtableid)
 
 	rdomain = rtable_l2(rtableid);
 	if (spd_tables == NULL || rdomain > spd_table_max) {
+		if (rdomain + 1 > UINT_MAX / sizeof(*rnh)) // Check for integer overflow
+			return (NULL);
+
 		if ((p = mallocarray(rdomain + 1, sizeof(*rnh),
 		    M_RTABLE, M_NOWAIT|M_ZERO)) == NULL)
 			return (NULL);
 
 		if (spd_tables != NULL) {
+			if (spd_table_max + 1 > UINT_MAX / sizeof(*rnh)) // Check for integer overflow
+				return (NULL);
+
 			memcpy(p, spd_tables, sizeof(*rnh) * (spd_table_max+1));
 			free(spd_tables, M_RTABLE,
 			    sizeof(*rnh) * (spd_table_max+1));
@@ -106,6 +112,9 @@ spd_table_add(unsigned int rtableid)
 		spd_tables = p;
 		spd_table_max = rdomain;
 	}
+
+	if (rdomain > spd_table_max) // Check for out-of-bounds access
+		return (NULL);
 
 	if (spd_tables[rdomain] == NULL) {
 		if (rn_inithead((void **)&rnh,
@@ -674,6 +683,9 @@ ipsec_delete_policy(struct ipsec_policy *ipo)
 
 	NET_ASSERT_LOCKED_EXCLUSIVE();
 
+	if (ipo == NULL)  // Check for NULL pointer
+		return EINVAL;
+
 	if (refcnt_rele(&ipo->ipo_refcnt) == 0)
 		return 0;
 
@@ -701,7 +713,8 @@ ipsec_delete_policy(struct ipsec_policy *ipo)
 	if (ipo->ipo_ids)
 		ipsp_ids_free(ipo->ipo_ids);
 
-	ipsec_in_use--;
+	if (ipsec_in_use > 0)  // Ensure no underflow
+		ipsec_in_use--;
 
 	pool_put(&ipsec_policy_pool, ipo);
 
@@ -725,6 +738,9 @@ ipsp_delete_acquire_timer(void *v)
 void
 ipsp_delete_acquire(struct ipsec_acquire *ipa)
 {
+	if (!ipa) {
+		return;
+	}
 	mtx_enter(&ipsec_acquire_mtx);
 	ipsp_delete_acquire_locked(ipa);
 	mtx_leave(&ipsec_acquire_mtx);
@@ -741,8 +757,19 @@ ipsp_delete_acquire_locked(struct ipsec_acquire *ipa)
 void
 ipsec_unref_acquire(struct ipsec_acquire *ipa)
 {
+	if (ipa == NULL || (uintptr_t)ipa > UINTPTR_MAX) {
+		return;
+	}
+
 	mtx_enter(&ipsec_acquire_mtx);
+
+	if ((uintptr_t)ipa > UINTPTR_MAX - sizeof(struct ipsec_acquire)) {
+		mtx_leave(&ipsec_acquire_mtx);
+		return;
+	}
+
 	ipsp_unref_acquire_locked(ipa);
+
 	mtx_leave(&ipsec_acquire_mtx);
 }
 
@@ -751,11 +778,17 @@ ipsp_unref_acquire_locked(struct ipsec_acquire *ipa)
 {
 	MUTEX_ASSERT_LOCKED(&ipsec_acquire_mtx);
 
+	if (ipa == NULL || ipa->ipa_policy == NULL)
+		return;
+
 	if (refcnt_rele(&ipa->ipa_refcnt) == 0)
 		return;
+
 	TAILQ_REMOVE(&ipsec_acquire_head, ipa, ipa_next);
-	TAILQ_REMOVE(&ipa->ipa_policy->ipo_acquires, ipa, ipa_ipo_next);
-	ipa->ipa_policy = NULL;
+	if (ipa->ipa_policy != NULL) {
+		TAILQ_REMOVE(&ipa->ipa_policy->ipo_acquires, ipa, ipa_ipo_next);
+		ipa->ipa_policy = NULL;
+	}
 
 	pool_put(&ipsec_acquire_pool, ipa);
 }
@@ -770,6 +803,10 @@ ipsp_pending_acquire(struct ipsec_policy *ipo, union sockaddr_union *gw)
 	struct ipsec_acquire *ipa;
 
 	NET_ASSERT_LOCKED();
+
+	if (gw == NULL || gw->sa.sa_len > sizeof(union sockaddr_union)) {
+		return 0;
+	}
 
 	mtx_enter(&ipsec_acquire_mtx);
 	TAILQ_FOREACH(ipa, &ipo->ipo_acquires, ipa_ipo_next) {

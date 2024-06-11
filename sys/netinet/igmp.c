@@ -119,6 +119,11 @@ igmp_init(void)
 	igmpcounters = counters_alloc(igps_ncounters);
 	router_alert = m_get(M_WAIT, MT_DATA);
 
+	if (router_alert == NULL || router_alert->m_len < sizeof(struct ipoption)) {
+		// Handle allocation failure or insufficient length as needed
+		return;
+	}
+
 	/*
 	 * Construct a Router Alert option (RAO) to use in report
 	 * messages as required by RFC2236.  This option has the
@@ -135,6 +140,13 @@ igmp_init(void)
 	ra->ipopt_list[1] = 0x04;
 	ra->ipopt_list[2] = 0x00;
 	ra->ipopt_list[3] = 0x00;
+
+	// Check for integer overflow before assigning to m_len
+	if ((sizeof(ra->ipopt_dst) + ra->ipopt_list[1]) > MCLBYTES) {
+		// Handle overflow as needed
+		return;
+	}
+
 	router_alert->m_len = sizeof(ra->ipopt_dst) + ra->ipopt_list[1];
 }
 
@@ -142,6 +154,11 @@ int
 rti_fill(struct in_multi *inm)
 {
 	struct router_info *rti;
+
+	// Check for null pointer
+	if (inm == NULL) {
+		return -1;
+	}
 
 	LIST_FOREACH(rti, &rti_head, rti_list) {
 		if (rti->rti_ifidx == inm->inm_ifidx) {
@@ -153,7 +170,16 @@ rti_fill(struct in_multi *inm)
 		}
 	}
 
+	// Validate the allocation size to avoid integer overflow
+	if (sizeof(*rti) > SIZE_MAX / M_MRTABLE) {
+		return -1;
+	}
+
 	rti = malloc(sizeof(*rti), M_MRTABLE, M_WAITOK);
+	if (rti == NULL) {
+		return -1; // Handle allocation failure
+	}
+	
 	rti->rti_ifidx = inm->inm_ifidx;
 	rti->rti_type = IGMP_v2_ROUTER;
 	LIST_INSERT_HEAD(&rti_head, rti, rti_list);
@@ -172,9 +198,15 @@ rti_find(struct ifnet *ifp)
 			return (rti);
 	}
 
+	if (sizeof(*rti) > SIZE_MAX)  // Avoid integer overflow
+		return (NULL);
 	rti = malloc(sizeof(*rti), M_MRTABLE, M_NOWAIT);
 	if (rti == NULL)
 		return (NULL);
+	
+	if (ifp->if_index < 0 || ifp->if_index > INT_MAX)  // Ensure valid index
+		return (NULL);
+
 	rti->rti_ifidx = ifp->if_index;
 	rti->rti_type = IGMP_v2_ROUTER;
 	LIST_INSERT_HEAD(&rti_head, rti, rti_list);
@@ -185,6 +217,10 @@ void
 rti_delete(struct ifnet *ifp)
 {
 	struct router_info *rti, *trti;
+
+	if (ifp == NULL || ifp->if_index < 0) {
+		return;
+	}
 
 	LIST_FOREACH_SAFE(rti, &rti_head, rti_list, trti) {
 		if (rti->rti_ifidx == ifp->if_index) {
@@ -485,25 +521,41 @@ igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 void
 igmp_joingroup(struct in_multi *inm, struct ifnet *ifp)
 {
-	int i;
+    int i;
+    
+    if (inm == NULL || ifp == NULL) {
+        return; // Prevent null pointer dereference
+    }
 
-	inm->inm_state = IGMP_IDLE_MEMBER;
+    inm->inm_state = IGMP_IDLE_MEMBER;
 
-	if (!IN_LOCAL_GROUP(inm->inm_addr.s_addr) &&
-	    (ifp->if_flags & IFF_LOOPBACK) == 0) {
-		i = rti_fill(inm);
-		igmp_sendpkt(ifp, inm, i, 0);
-		inm->inm_state = IGMP_DELAYING_MEMBER;
-		inm->inm_timer = IGMP_RANDOM_DELAY(
-		    IGMP_MAX_HOST_REPORT_DELAY * PR_FASTHZ);
-		igmp_timers_are_running = 1;
-	} else
-		inm->inm_timer = 0;
+    if (!IN_LOCAL_GROUP(inm->inm_addr.s_addr) &&
+        (ifp->if_flags & IFF_LOOPBACK) == 0) {
+        if ((i = rti_fill(inm)) < 0) {
+            return; // Ensure rti_fill returns a non-negative value
+        }
+        igmp_sendpkt(ifp, inm, i, 0);
+        inm->inm_state = IGMP_DELAYING_MEMBER;
+        
+        if (IGMP_MAX_HOST_REPORT_DELAY > INT_MAX / PR_FASTHZ) {
+            return; // Prevent integer overflow
+        }
+        
+        inm->inm_timer = IGMP_RANDOM_DELAY(
+            IGMP_MAX_HOST_REPORT_DELAY * PR_FASTHZ);
+        igmp_timers_are_running = 1;
+    } else {
+        inm->inm_timer = 0;
+    }
 }
 
 void
 igmp_leavegroup(struct in_multi *inm, struct ifnet *ifp)
 {
+	if (inm == NULL || ifp == NULL || inm->inm_rti == NULL) {
+		return; // Avoid null pointer dereference
+	}
+
 	switch (inm->inm_state) {
 	case IGMP_DELAYING_MEMBER:
 	case IGMP_IDLE_MEMBER:
@@ -559,7 +611,7 @@ igmp_checktimer(struct ifnet *ifp)
 		inm = ifmatoinm(ifma);
 		if (inm->inm_timer == 0) {
 			/* do nothing */
-		} else if (--inm->inm_timer == 0) {
+		} else if (inm->inm_timer > 0 && --inm->inm_timer == 0) {
 			if (inm->inm_state == IGMP_DELAYING_MEMBER) {
 				if (inm->inm_rti->rti_type == IGMP_v1_ROUTER)
 					igmp_sendpkt(ifp, inm,
@@ -583,9 +635,15 @@ igmp_slowtimo(void)
 	NET_LOCK();
 
 	LIST_FOREACH(rti, &rti_head, rti_list) {
-		if (rti->rti_type == IGMP_v1_ROUTER &&
-		    ++rti->rti_age >= IGMP_AGE_THRESHOLD) {
-			rti->rti_type = IGMP_v2_ROUTER;
+		if (rti->rti_type == IGMP_v1_ROUTER) {
+			if (rti->rti_age < IGMP_AGE_THRESHOLD - 1) {
+				rti->rti_age++;
+			} else {
+				rti->rti_age = IGMP_AGE_THRESHOLD;
+			}
+			if (rti->rti_age >= IGMP_AGE_THRESHOLD) {
+				rti->rti_type = IGMP_v2_ROUTER;
+			}
 		}
 	}
 
@@ -596,63 +654,74 @@ void
 igmp_sendpkt(struct ifnet *ifp, struct in_multi *inm, int type,
     in_addr_t addr)
 {
-	struct mbuf *m;
-	struct igmp *igmp;
-	struct ip *ip;
-	struct ip_moptions imo;
+    struct mbuf *m;
+    struct igmp *igmp;
+    struct ip *ip;
+    struct ip_moptions imo;
 
-	MGETHDR(m, M_DONTWAIT, MT_HEADER);
-	if (m == NULL)
-		return;
+    /* Validate 'type' */
+    if (type < 0 || type > 255) /* Assuming type is a single byte value */
+        return;
 
-	/*
-	 * Assume max_linkhdr + sizeof(struct ip) + IGMP_MINLEN
-	 * is smaller than mbuf size returned by MGETHDR.
-	 */
-	m->m_data += max_linkhdr;
-	m->m_len = sizeof(struct ip) + IGMP_MINLEN;
-	m->m_pkthdr.len = sizeof(struct ip) + IGMP_MINLEN;
+    /* Validate 'inm' and 'ifp' are not NULL */
+    if (inm == NULL || ifp == NULL)
+        return;
 
-	ip = mtod(m, struct ip *);
-	ip->ip_tos = 0;
-	ip->ip_len = htons(sizeof(struct ip) + IGMP_MINLEN);
-	ip->ip_off = 0;
-	ip->ip_p = IPPROTO_IGMP;
-	ip->ip_src.s_addr = INADDR_ANY;
-	if (addr) {
-		ip->ip_dst.s_addr = addr;
-	} else {
-		ip->ip_dst = inm->inm_addr;
-	}
+    MGETHDR(m, M_DONTWAIT, MT_HEADER);
+    if (m == NULL)
+        return;
 
-	m->m_data += sizeof(struct ip);
-	m->m_len -= sizeof(struct ip);
-	igmp = mtod(m, struct igmp *);
-	igmp->igmp_type = type;
-	igmp->igmp_code = 0;
-	igmp->igmp_group = inm->inm_addr;
-	igmp->igmp_cksum = 0;
-	igmp->igmp_cksum = in_cksum(m, IGMP_MINLEN);
-	m->m_data -= sizeof(struct ip);
-	m->m_len += sizeof(struct ip);
+    /*
+     * Assume max_linkhdr + sizeof(struct ip) + IGMP_MINLEN
+     * is smaller than mbuf size returned by MGETHDR.
+     */
+    if (max_linkhdr + sizeof(struct ip) + IGMP_MINLEN > MHLEN) /* MHLEN is the max mbuf header length */
+        return;
 
-	m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
-	imo.imo_ifidx = inm->inm_ifidx;
-	imo.imo_ttl = 1;
+    m->m_data += max_linkhdr;
+    m->m_len = sizeof(struct ip) + IGMP_MINLEN;
+    m->m_pkthdr.len = sizeof(struct ip) + IGMP_MINLEN;
 
-	/*
-	 * Request loopback of the report if we are acting as a multicast
-	 * router, so that the process-level routing daemon can hear it.
-	 */
+    ip = mtod(m, struct ip *);
+    ip->ip_tos = 0;
+    ip->ip_len = htons(sizeof(struct ip) + IGMP_MINLEN);
+    ip->ip_off = 0;
+    ip->ip_p = IPPROTO_IGMP;
+    ip->ip_src.s_addr = INADDR_ANY;
+    if (addr) {
+        ip->ip_dst.s_addr = addr;
+    } else {
+        ip->ip_dst = inm->inm_addr;
+    }
+
+    m->m_data += sizeof(struct ip);
+    m->m_len -= sizeof(struct ip);
+    igmp = mtod(m, struct igmp *);
+    igmp->igmp_type = type;
+    igmp->igmp_code = 0;
+    igmp->igmp_group = inm->inm_addr;
+    igmp->igmp_cksum = 0;
+    igmp->igmp_cksum = in_cksum(m, IGMP_MINLEN);
+    m->m_data -= sizeof(struct ip);
+    m->m_len += sizeof(struct ip);
+
+    m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
+    imo.imo_ifidx = inm->inm_ifidx;
+    imo.imo_ttl = 1;
+
+    /*
+     * Request loopback of the report if we are acting as a multicast
+     * router, so that the process-level routing daemon can hear it.
+     */
 #ifdef MROUTING
-	imo.imo_loop = (ip_mrouter[ifp->if_rdomain] != NULL);
+    imo.imo_loop = (ip_mrouter[ifp->if_rdomain] != NULL);
 #else
-	imo.imo_loop = 0;
+    imo.imo_loop = 0;
 #endif /* MROUTING */
 
-	ip_output(m, router_alert, NULL, IP_MULTICASTOPTS, &imo, NULL, 0);
+    ip_output(m, router_alert, NULL, IP_MULTICASTOPTS, &imo, NULL, 0);
 
-	igmpstat_inc(igps_snd_reports);
+    igmpstat_inc(igps_snd_reports);
 }
 
 /*
@@ -665,6 +734,9 @@ igmp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
+
+	if (name == NULL || oldlenp == NULL || (newp != NULL && newlen == 0))
+		return (EINVAL);
 
 	switch (name[0]) {
 	case IGMPCTL_STATS:
@@ -689,8 +761,16 @@ igmp_sysctl_igmpstat(void *oldp, size_t *oldlenp, void *newp)
 	memset(&igmpstat, 0, sizeof igmpstat);
 	counters_read(igmpcounters, counters, nitems(counters), NULL);
 
-	for (i = 0; i < nitems(counters); i++)
+	if (nitems(counters) > (sizeof(igmpstat) / sizeof(u_long))) {
+		return (EINVAL);
+	}
+
+	for (i = 0; i < nitems(counters); i++) {
+		if (counters[i] > ULONG_MAX) {
+			return (ERANGE);
+		}
 		words[i] = (u_long)counters[i];
+	}
 
 	return (sysctl_rdstruct(oldp, oldlenp, newp,
 	    &igmpstat, sizeof(igmpstat)));

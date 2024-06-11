@@ -116,8 +116,10 @@ tcp_print_holes(struct tcpcb *tp)
 		return;
 	printf("Hole report: start--end dups rxmit\n");
 	while (p) {
-		printf("%x--%x d %d r %x\n", p->start, p->end, p->dups,
-		    p->rxmit);
+		if ((unsigned long)p->start <= UINT_MAX && (unsigned long)p->end <= UINT_MAX &&
+		    (unsigned int)p->dups <= INT_MAX && (unsigned long)p->rxmit <= UINT_MAX) {
+			printf("%x--%x d %d r %x\n", p->start, p->end, p->dups, p->rxmit);
+		}
 		p = p->next;
 	}
 	printf("\n");
@@ -133,12 +135,12 @@ tcp_sack_output(struct tcpcb *tp)
 {
 	struct sackhole *p;
 
-	if (!tp->sack_enable)
+	if (!tp->sack_enable || !tp->snd_holes)
 		return (NULL);
 	p = tp->snd_holes;
 	while (p) {
 		if (p->dups >= tcprexmtthresh && SEQ_LT(p->rxmit, p->end)) {
-			if (SEQ_LT(p->rxmit, tp->snd_una)) {/* old SACK hole */
+			if (SEQ_LT(p->rxmit, tp->snd_una) || SEQ_GEQ(p->rxmit, UINT32_MAX) || SEQ_GEQ(p->end, UINT32_MAX)) {/* old SACK hole */
 				p = p->next;
 				continue;
 			}
@@ -162,30 +164,34 @@ tcp_sack_output(struct tcpcb *tp)
 void
 tcp_sack_adjust(struct tcpcb *tp)
 {
-	struct sackhole *cur = tp->snd_holes;
-	if (cur == NULL)
-		return; /* No holes */
-	if (SEQ_GEQ(tp->snd_nxt, tp->rcv_lastsack))
-		return; /* We're already beyond any SACKed blocks */
-	/*
-	 * Two cases for which we want to advance snd_nxt:
-	 * i) snd_nxt lies between end of one hole and beginning of another
-	 * ii) snd_nxt lies between end of last hole and rcv_lastsack
-	 */
-	while (cur->next) {
-		if (SEQ_LT(tp->snd_nxt, cur->end))
-			return;
-		if (SEQ_GEQ(tp->snd_nxt, cur->next->start))
-			cur = cur->next;
-		else {
-			tp->snd_nxt = cur->next->start;
-			return;
-		}
-	}
-	if (SEQ_LT(tp->snd_nxt, cur->end))
-		return;
-	tp->snd_nxt = tp->rcv_lastsack;
-	return;
+    struct sackhole *cur = tp->snd_holes;
+    if (cur == NULL)
+        return; /* No holes */
+    if (SEQ_GEQ(tp->snd_nxt, tp->rcv_lastsack))
+        return; /* We're already beyond any SACKed blocks */
+    /*
+     * Two cases for which we want to advance snd_nxt:
+     * i) snd_nxt lies between end of one hole and beginning of another
+     * ii) snd_nxt lies between end of last hole and rcv_lastsack
+     */
+    while (cur->next) {
+        if (SEQ_LT(tp->snd_nxt, cur->end))
+            return;
+        if (SEQ_GEQ(tp->snd_nxt, cur->next->start))
+            cur = cur->next;
+        else {
+            if (cur->next->start > cur->end && SEQ_GEQ(cur->next->start, tp->snd_una)) {
+                tp->snd_nxt = cur->next->start;
+            }
+            return;
+        }
+    }
+    if (SEQ_LT(tp->snd_nxt, cur->end))
+        return;
+    if (SEQ_GEQ(tp->rcv_lastsack, tp->snd_una)) {
+        tp->snd_nxt = tp->rcv_lastsack;
+    }
+    return;
 }
 
 /*
@@ -893,6 +899,10 @@ send:
 		case 0:	/*default to PF_INET*/
 		case AF_INET:
 			iphlen = sizeof(struct ip);
+			if (m->m_len < iphlen) {
+				m_freem(m);
+				return (EINVAL);
+			}
 			src.sa.sa_len = sizeof(struct sockaddr_in);
 			src.sa.sa_family = AF_INET;
 			src.sin.sin_addr = mtod(m, struct ip *)->ip_src;
@@ -903,6 +913,10 @@ send:
 #ifdef INET6
 		case AF_INET6:
 			iphlen = sizeof(struct ip6_hdr);
+			if (m->m_len < iphlen) {
+				m_freem(m);
+				return (EINVAL);
+			}
 			src.sa.sa_len = sizeof(struct sockaddr_in6);
 			src.sa.sa_family = AF_INET6;
 			src.sin6.sin6_addr = mtod(m, struct ip6_hdr *)->ip6_src;
@@ -918,6 +932,14 @@ send:
 		if (tdb == NULL) {
 			m_freem(m);
 			return (EPERM);
+		}
+
+		if (hdrlen < optlen || mtod(m, caddr_t) + hdrlen < mtod(m, caddr_t) || 
+		    hdrlen - optlen > INT_MAX - sigoff || 
+		    mtod(m, caddr_t) + hdrlen - optlen + sigoff < mtod(m, caddr_t)) {
+			m_freem(m);
+			tdb_unref(tdb);
+			return (EINVAL);
 		}
 
 		if (tcp_signature(tdb, tp->pf, m, th, iphlen, 0,
@@ -1337,8 +1359,10 @@ tcp_chopper(struct mbuf *m0, struct mbuf_list *ml, struct ifnet *ifp,
 	}
 #ifdef INET6
 	if (ip6) {
-		ip6->ip6_plen = htons(m0->m_pkthdr.len - iphlen);
-		in6_proto_cksum_out(m0, ifp);
+		if (m0->m_pkthdr.len >= iphlen && m0->m_pkthdr.len - iphlen <= UINT16_MAX) {
+			ip6->ip6_plen = htons(m0->m_pkthdr.len - iphlen);
+			in6_proto_cksum_out(m0, ifp);
+		}
 	}
 #endif
 
@@ -1355,40 +1379,49 @@ int
 tcp_if_output_tso(struct ifnet *ifp, struct mbuf **mp, struct sockaddr *dst,
     struct rtentry *rt, uint32_t ifcap, u_int mtu)
 {
-	struct mbuf_list ml;
-	int error;
+    struct mbuf_list ml;
+    int error;
 
-	/* caller must fail later or fragment */
-	if (!ISSET((*mp)->m_pkthdr.csum_flags, M_TCP_TSO))
-		return 0;
-	if ((*mp)->m_pkthdr.ph_mss > mtu) {
-		CLR((*mp)->m_pkthdr.csum_flags, M_TCP_TSO);
-		return 0;
-	}
+    /* Validate input pointers */
+    if (ifp == NULL || mp == NULL || *mp == NULL || dst == NULL || rt == NULL) {
+        return EINVAL;
+    }
 
-	/* network interface hardware will do TSO */
-	if (in_ifcap_cksum(*mp, ifp, ifcap)) {
-		if (ISSET(ifcap, IFCAP_TSOv4)) {
-			in_hdr_cksum_out(*mp, ifp);
-			in_proto_cksum_out(*mp, ifp);
-		}
+    /* Validate m_pkthdr.csum_flags and ph_mss */
+    if (!ISSET((*mp)->m_pkthdr.csum_flags, M_TCP_TSO)) {
+        return 0;
+    }
+    if ((*mp)->m_pkthdr.ph_mss > mtu) {
+        CLR((*mp)->m_pkthdr.csum_flags, M_TCP_TSO);
+        return 0;
+    }
+
+    /* network interface hardware will do TSO */
+    if (in_ifcap_cksum(*mp, ifp, ifcap)) {
+        if (ISSET(ifcap, IFCAP_TSOv4)) {
+            in_hdr_cksum_out(*mp, ifp);
+            in_proto_cksum_out(*mp, ifp);
+        }
 #ifdef INET6
-		if (ISSET(ifcap, IFCAP_TSOv6))
-			in6_proto_cksum_out(*mp, ifp);
+        if (ISSET(ifcap, IFCAP_TSOv6)) {
+            in6_proto_cksum_out(*mp, ifp);
+        }
 #endif
-		error = ifp->if_output(ifp, *mp, dst, rt);
-		if (!error)
-			tcpstat_inc(tcps_outhwtso);
-		goto done;
-	}
+        error = ifp->if_output(ifp, *mp, dst, rt);
+        if (!error) {
+            tcpstat_inc(tcps_outhwtso);
+        }
+        goto done;
+    }
 
-	/* as fallback do TSO in software */
-	if ((error = tcp_chopper(*mp, &ml, ifp, (*mp)->m_pkthdr.ph_mss)) ||
-	    (error = if_output_ml(ifp, &ml, dst, rt)))
-		goto done;
-	tcpstat_inc(tcps_outswtso);
+    /* as fallback do TSO in software */
+    if ((error = tcp_chopper(*mp, &ml, ifp, (*mp)->m_pkthdr.ph_mss)) ||
+        (error = if_output_ml(ifp, &ml, dst, rt))) {
+        goto done;
+    }
+    tcpstat_inc(tcps_outswtso);
 
  done:
-	*mp = NULL;
-	return error;
+    *mp = NULL;
+    return error;
 }

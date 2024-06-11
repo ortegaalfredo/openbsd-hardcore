@@ -452,11 +452,13 @@ udp_input(struct mbuf **mp, int *offp, int proto, int af)
 			}
 #ifdef INET6
 			if (ip6) {
-				if (!IN6_IS_ADDR_UNSPECIFIED(&inp->inp_faddr6))
-					if (!IN6_ARE_ADDR_EQUAL(
-					    &inp->inp_faddr6, &ip6->ip6_src) ||
+				if (!IN6_IS_ADDR_UNSPECIFIED(&inp->inp_faddr6)) {
+					if (IN6_IS_ADDR_UNSPECIFIED(&ip6->ip6_src)) 
+						continue;
+					if (!IN6_ARE_ADDR_EQUAL(&inp->inp_faddr6, &ip6->ip6_src) ||
 					    inp->inp_fport != uh->uh_sport)
 						continue;
+				}
 			} else
 #endif /* INET6 */
 			if (inp->inp_faddr.s_addr != INADDR_ANY) {
@@ -621,9 +623,13 @@ udp_input(struct mbuf **mp, int *offp, int proto, int af)
 		struct pipex_session *session;
 		int off = iphlen + sizeof(struct udphdr);
 
+		if (off < iphlen || (unsigned int)off > m->m_pkthdr.len) {
+			in_pcbunref(inp);
+			return IPPROTO_DONE;
+		}
+
 		if ((session = pipex_l2tp_lookup_session(m, off)) != NULL) {
-			m = *mp = pipex_l2tp_input(m, off, session,
-			    ipsecflowinfo);
+			m = *mp = pipex_l2tp_input(m, off, session, ipsecflowinfo);
 			pipex_rele_session(session);
 			if (m == NULL) {
 				in_pcbunref(inp);
@@ -650,6 +656,11 @@ udp_sbappend(struct inpcb *inp, struct mbuf *m, struct ip *ip,
 	struct socket *so = inp->inp_socket;
 	struct mbuf *opts = NULL;
 
+	if (hlen > INT_MAX - sizeof(*uh)) {
+		udpstat_inc(udps_fullsock);
+		m_freem(m);
+		return;
+	}
 	hlen += sizeof(*uh);
 
 	if (inp->inp_upcall != NULL) {
@@ -671,28 +682,46 @@ udp_sbappend(struct inpcb *inp, struct mbuf *m, struct ip *ip,
 	if (ip6 && (inp->inp_flags & IN6P_RECVDSTPORT)) {
 		struct mbuf **mp = &opts;
 
-		while (*mp)
+		while (*mp) {
+			if ((*mp)->m_next == NULL && (*mp)->m_len == sizeof(u_int16_t)) {
+				break;
+			}
 			mp = &(*mp)->m_next;
-		*mp = sbcreatecontrol((caddr_t)&uh->uh_dport, sizeof(u_int16_t),
-		    IPV6_RECVDSTPORT, IPPROTO_IPV6);
+		}
+		if (*mp == NULL) {
+			*mp = sbcreatecontrol((caddr_t)&uh->uh_dport, sizeof(u_int16_t),
+			    IPV6_RECVDSTPORT, IPPROTO_IPV6);
+		}
 	}
 #endif /* INET6 */
 	if (ip && (inp->inp_flags & INP_RECVDSTPORT)) {
 		struct mbuf **mp = &opts;
 
-		while (*mp)
+		while (*mp) {
+			if ((*mp)->m_next == NULL && (*mp)->m_len == sizeof(u_int16_t)) {
+				break;
+			}
 			mp = &(*mp)->m_next;
-		*mp = sbcreatecontrol((caddr_t)&uh->uh_dport, sizeof(u_int16_t),
-		    IP_RECVDSTPORT, IPPROTO_IP);
+		}
+		if (*mp == NULL) {
+			*mp = sbcreatecontrol((caddr_t)&uh->uh_dport, sizeof(u_int16_t),
+			    IP_RECVDSTPORT, IPPROTO_IP);
+		}
 	}
 #ifdef IPSEC
 	if (ipsecflowinfo && (inp->inp_flags & INP_IPSECFLOWINFO)) {
 		struct mbuf **mp = &opts;
 
-		while (*mp)
+		while (*mp) {
+			if ((*mp)->m_next == NULL && (*mp)->m_len == sizeof(u_int32_t)) {
+				break;
+			}
 			mp = &(*mp)->m_next;
-		*mp = sbcreatecontrol((caddr_t)&ipsecflowinfo,
-		    sizeof(u_int32_t), IP_IPSECFLOWINFO, IPPROTO_IP);
+		}
+		if (*mp == NULL) {
+			*mp = sbcreatecontrol((caddr_t)&ipsecflowinfo,
+			    sizeof(u_int32_t), IP_IPSECFLOWINFO, IPPROTO_IP);
+		}
 	}
 #endif
 	m_adj(m, hlen);
@@ -717,6 +746,10 @@ udp_sbappend(struct inpcb *inp, struct mbuf *m, struct ip *ip,
 void
 udp_notify(struct inpcb *inp, int errno)
 {
+	if (inp == NULL || inp->inp_socket == NULL) {
+		// Handle the error appropriately, e.g., log the error, return from the function, etc.
+		return;
+	}
 	inp->inp_socket->so_error = errno;
 	sorwakeup(inp->inp_socket);
 	sowwakeup(inp->inp_socket);
@@ -1101,6 +1134,9 @@ udp_attach(struct socket *so, int proto, int wait)
 	struct inpcbtable *table;
 	int error;
 
+	if (so == NULL || so->so_proto == NULL || so->so_proto->pr_domain == NULL)
+		return EINVAL;
+
 	if (so->so_pcb != NULL)
 		return EINVAL;
 
@@ -1114,14 +1150,21 @@ udp_attach(struct socket *so, int proto, int wait)
 	else
 #endif
 		table = &udbtable;
+
 	if ((error = in_pcballoc(so, table, wait)))
 		return error;
+
+	struct inpcb *pcb = sotoinpcb(so);
+	if (pcb == NULL)
+		return EINVAL;
+
 #ifdef INET6
-	if (sotoinpcb(so)->inp_flags & INP_IPV6)
-		sotoinpcb(so)->inp_ipv6.ip6_hlim = ip6_defhlim;
+	if (pcb->inp_flags & INP_IPV6)
+		pcb->inp_ipv6.ip6_hlim = ip6_defhlim;
 	else
 #endif /* INET6 */
-		sotoinpcb(so)->inp_ip.ip_ttl = ip_defttl;
+		pcb->inp_ip.ip_ttl = ip_defttl;
+
 	return 0;
 }
 
@@ -1130,10 +1173,16 @@ udp_detach(struct socket *so)
 {
 	struct inpcb *inp;
 
+	if (so == NULL)
+		return (EINVAL);
+
 	soassertlocked(so);
 
 	inp = sotoinpcb(so);
 	if (inp == NULL)
+		return (EINVAL);
+
+	if ((uintptr_t)inp < sizeof(struct inpcb))
 		return (EINVAL);
 
 	in_pcbdetach(inp);
@@ -1143,16 +1192,39 @@ udp_detach(struct socket *so)
 void
 udp_lock(struct socket *so)
 {
-	struct inpcb *inp = sotoinpcb(so);
+    if (so == NULL) {
+        return;
+    }
 
-	NET_ASSERT_LOCKED();
-	mtx_enter(&inp->inp_mtx);
+    struct inpcb *inp = sotoinpcb(so);
+    if (inp == NULL) {
+        return;
+    }
+
+    if ((uintptr_t)inp + sizeof(struct inpcb) < (uintptr_t)inp || (uintptr_t)inp + sizeof(struct inpcb) > UINTPTR_MAX) {
+        return;
+    }
+
+    NET_ASSERT_LOCKED();
+    mtx_enter(&inp->inp_mtx);
 }
 
 void
 udp_unlock(struct socket *so)
 {
-	struct inpcb *inp = sotoinpcb(so);
+	struct inpcb *inp;
+
+	if (so == NULL) {
+		// handle error or return to avoid null pointer dereference
+		return;
+	}
+
+	inp = sotoinpcb(so);
+
+	if (inp == NULL) {
+		// handle error or return to avoid further null pointer dereference
+		return;
+	}
 
 	NET_ASSERT_LOCKED();
 	mtx_leave(&inp->inp_mtx);
@@ -1161,15 +1233,27 @@ udp_unlock(struct socket *so)
 int
 udp_locked(struct socket *so)
 {
-	struct inpcb *inp = sotoinpcb(so);
+    if (so == NULL) {
+        return 0;
+    }
 
-	return mtx_owned(&inp->inp_mtx);
+    struct inpcb *inp = sotoinpcb(so);
+
+    if (inp == NULL) {
+        return 0;
+    }
+
+    return mtx_owned(&inp->inp_mtx);
 }
 
 int
 udp_bind(struct socket *so, struct mbuf *addr, struct proc *p)
 {
 	struct inpcb *inp = sotoinpcb(so);
+
+	if (so == NULL || addr == NULL || p == NULL || inp == NULL) {
+		return EINVAL;  // Return an error code for invalid arguments
+	}
 
 	soassertlocked(so);
 	return in_pcbbind(inp, addr, p);
@@ -1182,6 +1266,10 @@ udp_connect(struct socket *so, struct mbuf *addr)
 	int error;
 
 	soassertlocked(so);
+
+	// Check for NULL pointers and potential out-of-bounds issues.
+	if (so == NULL || addr == NULL || inp == NULL)
+		return (EINVAL);
 
 #ifdef INET6
 	if (inp->inp_flags & INP_IPV6) {
@@ -1204,7 +1292,12 @@ udp_connect(struct socket *so, struct mbuf *addr)
 int
 udp_disconnect(struct socket *so)
 {
+	if (so == NULL)
+		return (EINVAL);
+
 	struct inpcb *inp = sotoinpcb(so);
+	if (inp == NULL)
+		return (EINVAL);
 
 	soassertlocked(so);
 
@@ -1220,7 +1313,9 @@ udp_disconnect(struct socket *so)
 	}
 	in_pcbunset_laddr(inp);
 	in_pcbdisconnect(inp);
-	so->so_state &= ~SS_ISCONNECTED;		/* XXX */
+	if (so->so_state & SS_ISCONNECTED) {
+		so->so_state &= ~SS_ISCONNECTED;		/* XXX */
+	}
 
 	return (0);
 }
@@ -1228,6 +1323,15 @@ udp_disconnect(struct socket *so)
 int
 udp_shutdown(struct socket *so)
 {
+	if (so == NULL) {
+		return (-1); // Return error if socket pointer is NULL
+	}
+	
+	// Assuming soassertlocked and socantsendmore are safe functions
+	if (((unsigned long)so) > ULONG_MAX || ((unsigned long)so) < 0) {
+		return (-1); // Return error if socket pointer is out of bounds
+	}
+	
 	soassertlocked(so);
 	socantsendmore(so);
 	return (0);
@@ -1260,7 +1364,13 @@ udp_send(struct socket *so, struct mbuf *m, struct mbuf *addr,
 			session =
 			    pipex_l2tp_userland_lookup_session_ipv4(
 				m, inp->inp_faddr);
+
 		if (session != NULL) {
+			if ((m->m_len < 0) || (m->m_len > MCLBYTES)) {
+				m_freem(m);
+				return (EINVAL);
+			}
+
 			m = pipex_l2tp_userland_output(m, session);
 			pipex_rele_session(session);
 
@@ -1283,6 +1393,16 @@ udp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
 	int error;
+
+	/* Check for null pointers and integer overflows */
+	if (name == NULL || oldlenp == NULL || (newp == NULL && newlen != 0)) {
+		return (EINVAL);
+	}
+
+	/* Check for size_t overflow */
+	if (newlen > SIZE_MAX - sizeof(*oldlenp)) {
+		return (EOVERFLOW);
+	}
 
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
@@ -1328,6 +1448,11 @@ udp_sysctl_udpstat(void *oldp, size_t *oldlenp, void *newp)
 	struct udpstat udpstat;
 	u_long *words = (u_long *)&udpstat;
 	int i;
+
+	if (udps_ncounters > SIZE_MAX / sizeof(uint64_t) || 
+	    sizeof(udpstat) != (udps_ncounters * sizeof(u_long))) {
+		return -1; // Fail safely if size calculations are out of bounds
+	}
 
 	CTASSERT(sizeof(udpstat) == (nitems(counters) * sizeof(u_long)));
 	memset(&udpstat, 0, sizeof udpstat);

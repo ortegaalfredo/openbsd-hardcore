@@ -49,28 +49,33 @@ inet_nat64_mask(u_int32_t src, u_int32_t pfx, u_int8_t pfxlen)
 	else if (pfxlen > 32)
 		pfxlen = 32;
 	u32 =
-	    (src & ~htonl(0xffffffff << (32 - pfxlen))) |
-	    (pfx & htonl(0xffffffff << (32 - pfxlen)));
+	    (src & ~htonl(0xffffffff << (32 - pfxlen)) & 0xffffffff) |
+	    (pfx & htonl(0xffffffff << (32 - pfxlen)) & 0xffffffff);
 	return (u32);
-
 }
 
 int
 inet_nat64(int af, const void *src, void *dst,
     const void *pfx, u_int8_t pfxlen)
 {
-	switch (af) {
-	case AF_INET:
-		return (inet_nat64_inet(src, dst, pfx, pfxlen));
-	case AF_INET6:
-		return (inet_nat64_inet6(src, dst, pfx, pfxlen));
-	default:
+    if (src == NULL || dst == NULL || pfx == NULL || pfxlen == 0) {
 #ifndef _KERNEL
-		errno = EAFNOSUPPORT;
+        errno = EINVAL;
 #endif
-		return (-1);
-	}
-	/* NOTREACHED */
+        return (-1);
+    }
+    switch (af) {
+    case AF_INET:
+        return (inet_nat64_inet(src, dst, pfx, pfxlen));
+    case AF_INET6:
+        return (inet_nat64_inet6(src, dst, pfx, pfxlen));
+    default:
+#ifndef _KERNEL
+        errno = EAFNOSUPPORT;
+#endif
+        return (-1);
+    }
+    /* NOTREACHED */
 }
 
 int
@@ -80,6 +85,13 @@ inet_nat64_inet(const void *src, void *dst, const void *pfx, u_int8_t pfxlen)
 	const union inet_nat64_addr	*p = pfx;
 	union inet_nat64_addr		*d = dst;
 	int				 i, j;
+
+	if (!src || !dst || !pfx) {
+#ifndef _KERNEL
+		errno = EINVAL;
+#endif
+		return (-1);
+	}
 
 	switch (pfxlen) {
 	case 32:
@@ -108,6 +120,12 @@ inet_nat64_inet(const void *src, void *dst, const void *pfx, u_int8_t pfxlen)
 	for (j = 0; j < 4; j++) {
 		if (i == 8)
 			i++;
+		if (i >= 16 || j >= 16) { /* Ensure no out-of-bounds access */
+#ifndef _KERNEL
+			errno = ERANGE;
+#endif
+			return (-1);
+		}
 		d->u8[j] = s->u8[i++];
 	}
 
@@ -121,6 +139,14 @@ inet_nat64_inet6(const void *src, void *dst, const void *pfx, u_int8_t pfxlen)
 	const union inet_nat64_addr	*p = pfx;
 	union inet_nat64_addr		*d = dst;
 	int				 i, j;
+
+	/* Validate prefix length */
+	if (pfxlen > 128) {
+#ifndef _KERNEL
+		errno = EINVAL;
+#endif
+		return (-1);
+	}
 
 	/* first copy the prefix octets to the destination */
 	*d = *p;
@@ -151,11 +177,14 @@ inet_nat64_inet6(const void *src, void *dst, const void *pfx, u_int8_t pfxlen)
 	/* octet 8 is reserved and must be set to zero */
 	d->u8[8] = 0;
 
-	/* fill the other octets with the source and skip octet 8 */
+	/* Ensure we do not go out of bounds when filling other octets */
 	for (j = 0; j < 4; j++) {
-		if (i == 8)
-			i++;
-		d->u8[i++] = s->u8[j];
+		if (i < 16) {
+			if (i == 8)
+				i++;
+			if (i < 16)
+				d->u8[i++] = s->u8[j];
+		}
 	}
 
 	return (0);
@@ -165,7 +194,7 @@ int
 inet_nat46(int af, const void *src, void *dst,
     const void *pfx, u_int8_t pfxlen)
 {
-	if (pfxlen > 32) {
+	if (pfxlen > 32 || src == NULL || dst == NULL || pfx == NULL) {
 #ifndef _KERNEL
 		errno = EINVAL;
 #endif
@@ -193,6 +222,8 @@ inet_nat46_inet(const void *src, void *dst, const void *pfx, u_int8_t pfxlen)
 	const union inet_nat64_addr	*p = pfx;
 	union inet_nat64_addr		*d = dst;
 
+	if (pfxlen > 32) return -1; // pfxlen should be within 0-32 for valid masking.
+	
 	/* set the remaining bits to the source */
 	d->u32[0] = inet_nat64_mask(s->u32[3], p->u32[0], pfxlen);
 
@@ -205,6 +236,11 @@ inet_nat46_inet6(const void *src, void *dst, const void *pfx, u_int8_t pfxlen)
 	const union inet_nat64_addr	*s = src;
 	const union inet_nat64_addr	*p = pfx;
 	union inet_nat64_addr		*d = dst;
+
+	/* Ensure pfxlen is within valid range */
+	if (pfxlen > 32) {
+		return (-1); // Invalid prefix length
+	}
 
 	/* set the initial octets to zero */
 	d->u32[0] = d->u32[1] = d->u32[2] = 0;

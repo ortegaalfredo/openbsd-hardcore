@@ -108,7 +108,7 @@ in_canforward(struct in_addr in)
 	if (IN_CLASSA(in.s_addr)) {
 		net = in.s_addr & IN_CLASSA_NET;
 		if (net == 0 ||
-		    net == htonl(IN_LOOPBACKNET << IN_CLASSA_NSHIFT))
+		    net == htonl((u_int32_t)IN_LOOPBACKNET << IN_CLASSA_NSHIFT))
 			return (0);
 	}
 	return (1);
@@ -120,15 +120,20 @@ in_canforward(struct in_addr in)
 void
 in_socktrim(struct sockaddr_in *ap)
 {
-	char *cplim = (char *) &ap->sin_addr;
-	char *cp = (char *) (&ap->sin_addr + 1);
+    if (ap == NULL) return;
 
-	ap->sin_len = 0;
-	while (--cp >= cplim)
-		if (*cp) {
-			(ap)->sin_len = cp - (char *) (ap) + 1;
-			break;
-		}
+    char *cplim = (char *) &ap->sin_addr;
+    char *cp = (char *) (&ap->sin_addr + 1);
+
+    if (cplim >= ((char *) ap + sizeof(struct sockaddr_in))) return;
+    if (cp > ((char *) ap + sizeof(struct sockaddr_in))) cp = (char *) ap + sizeof(struct sockaddr_in);
+
+    ap->sin_len = 0;
+    while (--cp >= cplim)
+        if (*cp) {
+            (ap)->sin_len = cp - (char *) (ap) + 1;
+            break;
+        }
 }
 
 int
@@ -136,6 +141,9 @@ in_mask2len(struct in_addr *mask)
 {
 	int x, y;
 	u_char *p;
+
+	if (mask == NULL)
+		return -1; // or handle error as appropriate
 
 	p = (u_char *)mask;
 	for (x = 0; x < sizeof(*mask); x++) {
@@ -158,6 +166,9 @@ in_len2mask(struct in_addr *mask, int len)
 	int i;
 	u_char *p;
 
+	if (len < 0 || len > 32)
+		return;
+
 	p = (u_char *)mask;
 	bzero(mask, sizeof(*mask));
 	for (i = 0; i < len / 8; i++)
@@ -179,6 +190,9 @@ in_nam2sin(const struct mbuf *nam, struct sockaddr_in **sin)
 		return EINVAL;
 	if (sa->sa_len != sizeof(struct sockaddr_in))
 		return EINVAL;
+	// Check for potential overflow in mtod calculation
+	if ((uintptr_t)nam + nam->m_len < (uintptr_t)nam)
+		return EINVAL;
 	*sin = satosin(sa);
 
 	return 0;
@@ -187,6 +201,8 @@ in_nam2sin(const struct mbuf *nam, struct sockaddr_in **sin)
 int
 in_sa2sin(struct sockaddr *sa, struct sockaddr_in **sin)
 {
+	if (sa == NULL || sin == NULL)
+		return EINVAL;
 	if (sa->sa_family != AF_INET)
 		return EAFNOSUPPORT;
 	if (sa->sa_len != sizeof(struct sockaddr_in))
@@ -200,6 +216,10 @@ int
 in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp)
 {
 	int privileged;
+
+	if (so == NULL || data == NULL || ifp == NULL) {
+		return -1; // Error handling for null pointers
+	}
 
 	privileged = 0;
 	if ((so->so_state & SS_PRIV) != 0)
@@ -219,121 +239,121 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp)
 int
 in_ioctl(u_long cmd, caddr_t data, struct ifnet *ifp, int privileged)
 {
-	struct ifreq *ifr = (struct ifreq *)data;
-	struct ifaddr *ifa;
-	struct in_ifaddr *ia = NULL;
-	struct sockaddr_in *sin = NULL, oldaddr;
-	int error = 0;
+    struct ifreq *ifr = (struct ifreq *)data;
+    struct ifaddr *ifa;
+    struct in_ifaddr *ia = NULL;
+    struct sockaddr_in *sin = NULL, oldaddr;
+    int error = 0;
 
-	if (ifp == NULL)
-		return (ENXIO);
+    if (ifp == NULL)
+        return (ENXIO);
 
-	switch (cmd) {
-	case SIOCGIFADDR:
-	case SIOCGIFNETMASK:
-	case SIOCGIFDSTADDR:
-	case SIOCGIFBRDADDR:
-		return in_ioctl_get(cmd, data, ifp);
-	case SIOCSIFADDR:
-		if (!privileged)
-			return (EPERM);
-		return in_ioctl_set_ifaddr(cmd, data, ifp);
-	case SIOCAIFADDR:
-	case SIOCDIFADDR:
-		if (!privileged)
-			return (EPERM);
-		return in_ioctl_change_ifaddr(cmd, data, ifp);
-	case SIOCSIFNETMASK:
-	case SIOCSIFDSTADDR:
-	case SIOCSIFBRDADDR:
-		break;
-	default:
-		return (EOPNOTSUPP);
-	}
+    switch (cmd) {
+    case SIOCGIFADDR:
+    case SIOCGIFNETMASK:
+    case SIOCGIFDSTADDR:
+    case SIOCGIFBRDADDR:
+        return in_ioctl_get(cmd, data, ifp);
+    case SIOCSIFADDR:
+        if (!privileged)
+            return (EPERM);
+        return in_ioctl_set_ifaddr(cmd, data, ifp);
+    case SIOCAIFADDR:
+    case SIOCDIFADDR:
+        if (!privileged)
+            return (EPERM);
+        return in_ioctl_change_ifaddr(cmd, data, ifp);
+    case SIOCSIFNETMASK:
+    case SIOCSIFDSTADDR:
+    case SIOCSIFBRDADDR:
+        break;
+    default:
+        return (EOPNOTSUPP);
+    }
 
-	if (!privileged)
-		return (EPERM);
+    if (!privileged)
+        return (EPERM);
 
-	if (ifr->ifr_addr.sa_family == AF_INET) {
-		error = in_sa2sin(&ifr->ifr_addr, &sin);
-		if (error)
-			return (error);
-	}
+    if (ifr->ifr_addr.sa_family == AF_INET) {
+        error = in_sa2sin(&ifr->ifr_addr, &sin);
+        if (error)
+            return (error);
+    }
 
-	NET_LOCK();
-	KERNEL_LOCK();
+    NET_LOCK();
+    KERNEL_LOCK();
 
-	TAILQ_FOREACH(ifa, &ifp->if_addrlist, ifa_list) {
-		if (ifa->ifa_addr->sa_family != AF_INET)
-			continue;
-		/* find first address or exact match */
-		if (ia == NULL)
-			ia = ifatoia(ifa);
-		if (sin == NULL || sin->sin_addr.s_addr == INADDR_ANY)
-			break;
-		if (ifatoia(ifa)->ia_addr.sin_addr.s_addr ==
-		    sin->sin_addr.s_addr) {
-			ia = ifatoia(ifa);
-			break;
-		}
-	}
-	if (ia == NULL) {
-		error = EADDRNOTAVAIL;
-		goto err;
-	}
+    TAILQ_FOREACH(ifa, &ifp->if_addrlist, ifa_list) {
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        /* find first address or exact match */
+        if (ia == NULL)
+            ia = ifatoia(ifa);
+        if (sin == NULL || sin->sin_addr.s_addr == INADDR_ANY)
+            break;
+        if (ifatoia(ifa)->ia_addr.sin_addr.s_addr ==
+            sin->sin_addr.s_addr) {
+            ia = ifatoia(ifa);
+            break;
+        }
+    }
+    if (ia == NULL) {
+        error = EADDRNOTAVAIL;
+        goto err;
+    }
 
-	switch (cmd) {
-	case SIOCSIFDSTADDR:
-		if ((ifp->if_flags & IFF_POINTOPOINT) == 0) {
-			error = EINVAL;
-			break;
-		}
-		error = in_sa2sin(&ifr->ifr_dstaddr, &sin);
-		if (error)
-			break;
-		oldaddr = ia->ia_dstaddr;
-		ia->ia_dstaddr = *sin;
-		error = (*ifp->if_ioctl)(ifp, SIOCSIFDSTADDR, (caddr_t)ia);
-		if (error) {
-			ia->ia_dstaddr = oldaddr;
-			break;
-		}
-		in_scrubhost(ia, &oldaddr);
-		in_addhost(ia, &ia->ia_dstaddr);
-		break;
+    switch (cmd) {
+    case SIOCSIFDSTADDR:
+        if ((ifp->if_flags & IFF_POINTOPOINT) == 0) {
+            error = EINVAL;
+            break;
+        }
+        error = in_sa2sin(&ifr->ifr_dstaddr, &sin);
+        if (error)
+            break;
+        oldaddr = ia->ia_dstaddr;
+        ia->ia_dstaddr = *sin;
+        error = (*ifp->if_ioctl)(ifp, SIOCSIFDSTADDR, (caddr_t)ia);
+        if (error) {
+            ia->ia_dstaddr = oldaddr;
+            break;
+        }
+        in_scrubhost(ia, &oldaddr);
+        in_addhost(ia, &ia->ia_dstaddr);
+        break;
 
-	case SIOCSIFBRDADDR:
-		if ((ifp->if_flags & IFF_BROADCAST) == 0) {
-			error = EINVAL;
-			break;
-		}
-		error = in_sa2sin(&ifr->ifr_broadaddr, &sin);
-		if (error)
-			break;
-		ifa_update_broadaddr(ifp, &ia->ia_ifa, sintosa(sin));
-		break;
+    case SIOCSIFBRDADDR:
+        if ((ifp->if_flags & IFF_BROADCAST) == 0) {
+            error = EINVAL;
+            break;
+        }
+        error = in_sa2sin(&ifr->ifr_broadaddr, &sin);
+        if (error)
+            break;
+        ifa_update_broadaddr(ifp, &ia->ia_ifa, sintosa(sin));
+        break;
 
-	case SIOCSIFNETMASK:
-		if (ifr->ifr_addr.sa_len < 8) {
-			error = EINVAL;
-			break;
-		}
-		/* do not check inet family or strict len */
-		sin = satosin(&ifr->ifr_addr);
-		if (ntohl(sin->sin_addr.s_addr) &
-		    (~ntohl(sin->sin_addr.s_addr) >> 1)) {
-			/* non-contiguous netmask */
-			error = EINVAL;
-			break;
-		}
-		ia->ia_netmask = ia->ia_sockmask.sin_addr.s_addr =
-		    sin->sin_addr.s_addr;
-		break;
-	}
+    case SIOCSIFNETMASK:
+        if (ifr->ifr_addr.sa_len < 8) {
+            error = EINVAL;
+            break;
+        }
+        /* do not check inet family or strict len */
+        sin = satosin(&ifr->ifr_addr);
+        if (ntohl(sin->sin_addr.s_addr) &
+            (~ntohl(sin->sin_addr.s_addr) >> 1)) {
+            /* non-contiguous netmask */
+            error = EINVAL;
+            break;
+        }
+        ia->ia_netmask = ia->ia_sockmask.sin_addr.s_addr =
+            sin->sin_addr.s_addr;
+        break;
+    }
 err:
-	KERNEL_UNLOCK();
-	NET_UNLOCK();
-	return (error);
+    KERNEL_UNLOCK();
+    NET_UNLOCK();
+    return (error);
 }
 
 int
@@ -364,7 +384,17 @@ in_ioctl_set_ifaddr(u_long cmd, caddr_t data, struct ifnet *ifp)
 		break;
 	}
 	if (ia == NULL) {
+		if (sizeof(struct in_ifaddr) > SIZE_MAX) {
+			KERNEL_UNLOCK();
+			NET_UNLOCK();
+			return (ENOMEM);
+		}
 		ia = malloc(sizeof *ia, M_IFADDR, M_WAITOK | M_ZERO);
+		if (ia == NULL) {
+			KERNEL_UNLOCK();
+			NET_UNLOCK();
+			return (ENOMEM);
+		}
 		refcnt_init_trace(&ia->ia_ifa.ifa_refcnt, DT_REFCNT_IDX_IFADDR);
 		ia->ia_addr.sin_family = AF_INET;
 		ia->ia_addr.sin_len = sizeof(ia->ia_addr);
@@ -542,8 +572,13 @@ in_ioctl_get(u_long cmd, caddr_t data, struct ifnet *ifp)
 	struct sockaddr_in *sin = NULL;
 	int error = 0;
 
+	if (data == NULL || ifp == NULL)
+		return (EINVAL);
+
 	sa = &ifr->ifr_addr;
 	if (sa->sa_family == AF_INET) {
+		if (sa->sa_len > sizeof(struct sockaddr_in))
+			return (EINVAL);
 		sa->sa_len = sizeof(struct sockaddr_in);
 		error = in_sa2sin(sa, &sin);
 		if (error)
@@ -611,6 +646,9 @@ err:
 void
 in_ifscrub(struct ifnet *ifp, struct in_ifaddr *ia)
 {
+	if (ifp == NULL || ia == NULL)
+		return;
+
 	if (ISSET(ifp->if_flags, IFF_POINTOPOINT))
 		in_scrubhost(ia, &ia->ia_dstaddr);
 	else if (!ISSET(ifp->if_flags, IFF_LOOPBACK))
@@ -678,9 +716,17 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 	if (error)
 		goto out;
 
+	// Check for potential integer overflow before calculations
+	if (ia->ia_netmask != 0) {
+		if (UINT32_MAX - i < ia->ia_netmask) {
+			error = ERANGE;  // or a more suitable error code
+			goto out;
+		}
+	}
 
 	ia->ia_net = i & ia->ia_netmask;
 	in_socktrim(&ia->ia_sockmask);
+
 	/*
 	 * Add route for the network.
 	 */
@@ -689,6 +735,11 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 		if (IN_RFC3021_SUBNET(ia->ia_netmask))
 			ia->ia_broadaddr.sin_addr.s_addr = 0;
 		else {
+			// Check for potential overflow before assignment
+			if ((UINT32_MAX - ia->ia_netmask) < ia->ia_net) {
+				error = ERANGE;  // or a more suitable error code
+				goto out;
+			}
 			ia->ia_broadaddr.sin_addr.s_addr =
 			    ia->ia_net | ~ia->ia_netmask;
 		}
@@ -724,8 +775,12 @@ out:
 void
 in_purgeaddr(struct ifaddr *ifa)
 {
+	if (ifa == NULL) return;
+
 	struct ifnet *ifp = ifa->ifa_ifp;
 	struct in_ifaddr *ia = ifatoia(ifa);
+
+	if (ifp == NULL || ia == NULL) return;
 
 	NET_ASSERT_LOCKED();
 
@@ -747,6 +802,12 @@ in_purgeaddr(struct ifaddr *ifa)
 int
 in_addhost(struct in_ifaddr *ia, struct sockaddr_in *dst)
 {
+	if (ia == NULL || dst == NULL || ia->ia_ifa.ifa_ifp == NULL) {
+		return -1; // return error code for null input
+	}
+	if (ia->ia_ifa.ifa_ifp->if_rdomain < 0) {
+		return -1; // return error code for invalid domain
+	}
 	return rt_ifa_add(&ia->ia_ifa, RTF_HOST | RTF_MPATH,
 	    sintosa(dst), ia->ia_ifa.ifa_ifp->if_rdomain);
 }
@@ -754,6 +815,14 @@ in_addhost(struct in_ifaddr *ia, struct sockaddr_in *dst)
 int
 in_scrubhost(struct in_ifaddr *ia, struct sockaddr_in *dst)
 {
+	if (!ia || !dst || !ia->ia_ifa.ifa_ifp) {
+		return -1; // error handling
+	}
+
+	if (((uintptr_t)ia->ia_ifa.ifa_ifp + sizeof(*(ia->ia_ifa.ifa_ifp))) <= (uintptr_t)ia->ia_ifa.ifa_ifp) {
+		return -1; // integer overflow check
+	}
+
 	return rt_ifa_del(&ia->ia_ifa, RTF_HOST,
 	    sintosa(dst), ia->ia_ifa.ifa_ifp->if_rdomain);
 }
@@ -804,19 +873,24 @@ in_broadcast(struct in_addr in, u_int rtableid)
 	struct ifaddr *ifa;
 	u_int rdomain;
 
+	if (rtableid > UINT_MAX - 1)
+		return 0;
 	rdomain = rtable_l2(rtableid);
 
 #define ia (ifatoia(ifa))
 	TAILQ_FOREACH(ifn, &ifnetlist, if_list) {
-		if (ifn->if_rdomain != rdomain)
+		if (ifn == NULL || ifn->if_rdomain != rdomain)
 			continue;
 		if ((ifn->if_flags & IFF_BROADCAST) == 0)
 			continue;
-		TAILQ_FOREACH(ifa, &ifn->if_addrlist, ifa_list)
+		TAILQ_FOREACH(ifa, &ifn->if_addrlist, ifa_list) {
+			if (ifa == NULL || ifa->ifa_addr == NULL)
+				continue;
 			if (ifa->ifa_addr->sa_family == AF_INET &&
 			    in.s_addr != ia->ia_addr.sin_addr.s_addr &&
 			    in.s_addr == ia->ia_broadaddr.sin_addr.s_addr)
 				return 1;
+		}
 	}
 	return (0);
 #undef ia
@@ -930,6 +1004,10 @@ in_hasmulti(struct in_addr *ap, struct ifnet *ifp)
 	struct in_multi *inm;
 	int joined;
 
+	if (ap == NULL || ifp == NULL) {
+		return 0;
+	}
+
 	IN_LOOKUP_MULTI(*ap, ifp, inm);
 	joined = (inm != NULL);
 
@@ -956,6 +1034,9 @@ in_ifdetach(struct ifnet *ifp)
 void
 in_prefixlen2mask(struct in_addr *maskp, int plen)
 {
+	if (plen < 0 || plen > 32)
+		return;
+
 	if (plen == 0)
 		maskp->s_addr = 0;
 	else

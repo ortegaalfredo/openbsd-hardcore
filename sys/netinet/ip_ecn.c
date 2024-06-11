@@ -88,6 +88,8 @@ ip_ecn_ingress(int mode, u_int8_t *outer, u_int8_t *inner)
 {
 	if (!outer || !inner)
 		panic("NULL pointer passed to ip_ecn_ingress");
+	if (mode < 0 || mode > INT_MAX)
+		panic("Invalid mode passed to ip_ecn_ingress");
 
 	*outer = *inner;
 	switch (mode) {
@@ -108,6 +110,8 @@ ip_ecn_ingress(int mode, u_int8_t *outer, u_int8_t *inner)
 		break;
 	case ECN_NOCARE:	/* no consideration to ECN */
 		break;
+	default:
+		panic("Unknown mode passed to ip_ecn_ingress");
 	}
 }
 
@@ -119,40 +123,33 @@ ip_ecn_ingress(int mode, u_int8_t *outer, u_int8_t *inner)
 int
 ip_ecn_egress(int mode, u_int8_t *outer, u_int8_t *inner)
 {
-	if (!outer || !inner)
-		panic("NULL pointer passed to ip_ecn_egress");
+    if (!outer || !inner)
+        panic("NULL pointer passed to ip_ecn_egress");
 
-	switch (mode) {
-	case ECN_ALLOWED:
-	case ECN_ALLOWED_IPSEC:
-		/*
-		 * full-functionality: if the outer is CE and the inner is
-		 * not-ECT, should drop it.  otherwise, copy CE.
-		 * However, according to RFC4301, we should just leave the
-		 * inner as non-ECT for IPsec.
-		 */
-		if ((*outer & IPTOS_ECN_MASK) == IPTOS_ECN_CE) {
-			if ((*inner & IPTOS_ECN_MASK) == IPTOS_ECN_NOTECT) {
-				if (mode == ECN_ALLOWED_IPSEC)
-					return (1);
-				else
-					return (0);
-			}
-			*inner |= IPTOS_ECN_CE;
-		}
-		break;
-	case ECN_FORBIDDEN:		/* ECN forbidden */
-		/*
-		 * limited-functionality: if the outer is CE, should drop it.
-		 * otherwise, leave the inner.
-		 */
-		if ((*outer & IPTOS_ECN_MASK) == IPTOS_ECN_CE)
-			return (0);
-		break;
-	case ECN_NOCARE:	/* no consideration to ECN */
-		break;
-	}
-	return (1);
+    if (mode < ECN_ALLOWED || mode > ECN_NOCARE)
+        panic("Invalid mode passed to ip_ecn_egress");
+
+    switch (mode) {
+    case ECN_ALLOWED:
+    case ECN_ALLOWED_IPSEC:
+        if ((*outer & IPTOS_ECN_MASK) == IPTOS_ECN_CE) {
+            if ((*inner & IPTOS_ECN_MASK) == IPTOS_ECN_NOTECT) {
+                if (mode == ECN_ALLOWED_IPSEC)
+                    return (1);
+                else
+                    return (0);
+            }
+            *inner |= IPTOS_ECN_CE;
+        }
+        break;
+    case ECN_FORBIDDEN:
+        if ((*outer & IPTOS_ECN_MASK) == IPTOS_ECN_CE)
+            return (0);
+        break;
+    case ECN_NOCARE:
+        break;
+    }
+    return (1);
 }
 
 /*
@@ -163,15 +160,17 @@ ip_ecn_egress(int mode, u_int8_t *outer, u_int8_t *inner)
 void
 ip_tos_patch(struct ip *ip, uint8_t tos)
 {
-	uint16_t old;
-	uint16_t new;
-	uint32_t x;
+    uint16_t old;
+    uint16_t new;
+    uint32_t x;
 
-	old = htons(ip->ip_tos);
-	new = htons(tos);
+    if(ip == NULL) return;
 
-	ip->ip_tos = tos;
+    old = htons(ip->ip_tos);
+    new = htons(tos);
 
-	x = ip->ip_sum + old - new;
-	ip->ip_sum = (x) + (x >> 16);
+    ip->ip_tos = tos;
+
+    x = (uint32_t)ip->ip_sum + old - new;
+    ip->ip_sum = (uint16_t)(x + (x >> 16));
 }

@@ -117,17 +117,17 @@ tcp_trace(short act, short ostate, struct tcpcb *tp, struct tcpcb *otp,
 	int flags;
 #endif
 	int pf = PF_UNSPEC;
+	if (tcp_debx < 0 || tcp_debx >= TCP_NDEBUG) return; // Bounds check for tcp_debx
 	struct tcp_debug *td = &tcp_debug[tcp_debx++];
-	struct tcpiphdr *ti = (struct tcpiphdr *)headers;
-	struct tcpipv6hdr *ti6 = (struct tcpipv6hdr *)headers;
-	struct tcphdr *th;
-
+	
 	if (tcp_debx == TCP_NDEBUG)
 		tcp_debx = 0;
+
 	td->td_time = iptime();
 	td->td_act = act;
 	td->td_ostate = ostate;
 	td->td_tcb = (caddr_t)otp;
+
 	if (tp) {
 		pf = tp->pf;
 		td->td_cb = *tp;
@@ -136,7 +136,11 @@ tcp_trace(short act, short ostate, struct tcpcb *tp, struct tcpcb *otp,
 
 	bzero(&td->td_ti6, sizeof(struct tcpipv6hdr));
 	bzero(&td->td_ti, sizeof(struct tcpiphdr));
+	
 	if (headers) {
+		struct tcpiphdr *ti = (struct tcpiphdr *)headers;
+		struct tcpipv6hdr *ti6 = (struct tcpipv6hdr *)headers;
+
 		/* The address family may be in tcpcb or ip header. */
 		if (pf == PF_UNSPEC) {
 			switch (ti6->ti6_i.ip6_vfc & IPV6_VERSION_MASK) {
@@ -150,16 +154,19 @@ tcp_trace(short act, short ostate, struct tcpcb *tp, struct tcpcb *otp,
 				break;
 			}
 		}
+		struct tcphdr *th = NULL;
 		switch (pf) {
 #ifdef INET6
 		case PF_INET6:
 			th = &ti6->ti6_t;
+			if (len < 0 || len > sizeof(struct tcpipv6hdr)) return; // Bounds check for len
 			td->td_ti6 = *ti6;
 			td->td_ti6.ti6_plen = len;
 			break;
 #endif /* INET6 */
 		case PF_INET:
 			th = &ti->ti_t;
+			if (len < 0 || len > sizeof(struct tcpiphdr)) return; // Bounds check for len
 			td->td_ti = *ti;
 			td->td_ti.ti_len = len;
 			break;
@@ -199,7 +206,16 @@ tcp_trace(short act, short ostate, struct tcpcb *tp, struct tcpcb *otp,
 		flags = th->th_flags;
 		if (flags) {
 			char *cp = "<";
-#define pf(f) { if (th->th_flags&TH_##f) { printf("%s%s", cp, #f); cp = ","; } }
+#define pf(f) { \
+    if (f < 0 || f >= MAX_FLAGS) { \
+        fprintf(stderr, "Error: Flag index out of bounds\n"); \
+        exit(EXIT_FAILURE); \
+    } \
+    if (th->th_flags & (1 << f)) { \
+        printf("%s%s", cp, #f); \
+        cp = ","; \
+    } \
+}
 			pf(SYN); pf(ACK); pf(FIN); pf(RST); pf(PUSH); pf(URG);
 			printf(">");
 		}
