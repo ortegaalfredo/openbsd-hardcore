@@ -287,14 +287,6 @@ in6_ioctl_change_ifaddr(u_long cmd, caddr_t data, struct ifnet *ifp)
 	struct sockaddr_in6 *sa6 = NULL;
 	int error = 0, newifaddr = 0, plen;
 
-	/* Check for null pointers */
-	if (data == NULL || ifp == NULL)
-		return EINVAL;
-
-	/* Ensure cmd is within valid range */
-	if (cmd != SIOCAIFADDR_IN6 && cmd != SIOCDIFADDR_IN6)
-		return EINVAL;
-
 	switch (cmd) {
 	case SIOCAIFADDR_IN6:
 		sa = sin6tosa(&ifra->ifra_addr);
@@ -408,15 +400,7 @@ in6_ioctl_get(u_long cmd, caddr_t data, struct ifnet *ifp)
 	struct	sockaddr_in6 *sa6 = NULL;
 	int	error = 0;
 
-	if (ifr == NULL || ifp == NULL) {
-		return EINVAL;
-	}
-
 	sa = sin6tosa(&ifr->ifr_addr);
-	if (sa == NULL || sa->sa_len > sizeof(struct sockaddr_in6) || sa->sa_family == AF_INET6) {
-		return EINVAL;
-	}
-
 	if (sa->sa_family == AF_INET6) {
 		sa->sa_len = sizeof(struct sockaddr_in6);
 		error = in6_sa2sin6(sa, &sa6);
